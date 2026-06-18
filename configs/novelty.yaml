@@ -1,0 +1,56 @@
+# configs/novelty.yaml
+
+task_name: "novelty_detection"
+task_type: "posthoc_uncertainty"
+
+description: >
+  Post-hoc uncertainty and novelty detection using trained IQA model features.
+  This module estimates whether a scan is unfamiliar to the training distribution
+  and whether model predictions should be trusted.
+
+base_model:
+  checkpoint: "runs/task_based_ternary_iqa/best.pt"
+  num_classes: 3
+  target_key: "quality_ternary"
+
+image_keys:
+  - dwi
+  - adc
+  - t2
+  - prostate_mask
+
+feature_extraction:
+  layer: "penultimate"
+  batch_size: 1
+
+methods:
+  softmax_confidence: true
+  entropy: true
+  mahalanobis_distance: true
+  metadata_novelty: true
+
+mahalanobis:
+  covariance_regularization: 0.0001
+  fit_on_split: "train"
+
+metadata_novelty:
+  enabled: true
+  fields:
+    - b_value
+    - vendor
+    - field_strength
+    - site
+    - slice_thickness
+    - spacing_x
+    - spacing_y
+    - spacing_z
+
+evaluation:
+  compare_with_quality_error: true
+  compare_with_downstream_failure: true
+  compare_with_segmentation_dice: true
+
+output:
+  novelty_csv: "reports/predictions/novelty_scores.csv"
+  summary_csv: "reports/tables/novelty_summary.csv"
+  figure_dir: "reports/figures/novelty"

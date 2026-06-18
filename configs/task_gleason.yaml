@@ -1,0 +1,83 @@
+# configs/task_gleason.yaml
+
+task_name: "gleason_ge2"
+task_type: "binary_classification"
+
+description: >
+  Binary downstream classification task for clinically significant prostate cancer,
+  defined as Gleason grade group >= 2 versus Gleason grade group < 2.
+
+target_key: "gleason_ge2"
+num_classes: 2
+
+class_names:
+  0: "gleason_lt2"
+  1: "gleason_ge2"
+
+image_keys:
+  - dwi
+  - adc
+  - t2
+  - prostate_mask
+
+required_modalities:
+  - dwi
+  - t2
+
+optional_modalities:
+  - adc
+  - prostate_mask
+
+model:
+  name: "densenet121"
+  spatial_dims: 3
+  in_channels: 4
+  out_channels: 2
+  dropout_prob: 0.0
+
+training:
+  epochs: 80
+  batch_size: 2
+  learning_rate: 0.00001
+  weight_decay: 0.00001
+  use_weighted_sampler: true
+  early_stopping_patience: 15
+  best_metric: "val_auc"
+  best_metric_mode: "max"
+
+preprocessing:
+  roi_size:
+    - 160
+    - 160
+    - 64
+  normalize: "percentile"
+  percentile_lower: 1
+  percentile_upper: 99
+  crop_mode: "prostate_mask_if_available"
+  allow_missing_adc: true
+  allow_missing_mask: true
+
+augmentation:
+  random_flip: true
+  random_affine: true
+  gaussian_noise: true
+  intensity_shift: true
+  intensity_scale: true
+
+metrics:
+  - auc
+  - pr_auc
+  - accuracy
+  - balanced_accuracy
+  - sensitivity
+  - specificity
+  - f1
+
+operating_points:
+  sensitivity_at_specificity: 0.80
+  specificity_at_sensitivity: 0.80
+
+output:
+  run_dir: "runs/downstream_gleason_ge2"
+  prediction_csv: "reports/predictions/gleason_val_predictions.csv"
+  metrics_json: "reports/tables/gleason_val_metrics.json"

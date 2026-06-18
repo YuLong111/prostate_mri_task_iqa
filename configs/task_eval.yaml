@@ -1,0 +1,58 @@
+# configs/task_eval.yaml
+
+task_name: "quality_vs_downstream_task_evaluation"
+
+description: >
+  Evaluate whether predicted image quality explains downstream task performance.
+
+quality_predictions_csv: "reports/predictions/val_iqa_predictions.csv"
+novelty_scores_csv: "reports/predictions/val_novelty_scores.csv"
+
+downstream_tasks:
+  pirads_ge4:
+    prediction_csv: "runs/downstream_pirads_ge4/val_predictions.csv"
+    task_type: "binary_classification"
+    target_key: "pirads_ge4"
+    probability_column: "prob_1"
+    prediction_column: "pred_label"
+    true_label_column: "true_label"
+
+  gleason_ge2:
+    prediction_csv: "runs/downstream_gleason_ge2/val_predictions.csv"
+    task_type: "binary_classification"
+    target_key: "gleason_ge2"
+    probability_column: "prob_1"
+    prediction_column: "pred_label"
+    true_label_column: "true_label"
+
+  lesion_segmentation:
+    metrics_csv: "reports/tables/segmentation_metrics.csv"
+    task_type: "segmentation"
+    metrics:
+      - dice
+      - iou
+      - asd
+      - hd95
+
+quality_groups:
+  reject_label: 0
+  caution_label: 1
+  accept_label: 2
+
+analysis:
+  compare_downstream_accuracy_by_quality_group: true
+  compare_segmentation_metrics_by_quality_group: true
+  correlate_quality_score_with_task_success: true
+  correlate_novelty_with_task_failure: true
+
+statistics:
+  classification_group_test: "chi_square_or_fisher"
+  continuous_metric_group_test: "mann_whitney_or_kruskal"
+  correlation_method: "spearman"
+  confidence_interval: 0.95
+
+output:
+  merged_table: "reports/tables/merged_quality_task_table.csv"
+  quality_group_summary: "reports/tables/quality_group_task_summary.csv"
+  novelty_failure_summary: "reports/tables/novelty_failure_summary.csv"
+  figure_dir: "reports/figures/task_specific_eval"

@@ -1,0 +1,58 @@
+# configs/oof_pirads.yaml
+
+task_name: "oof_pirads_ge4"
+task_type: "out_of_fold_binary_classification"
+
+description: >
+  Generate out-of-fold predictions for PI-RADS >= 4 classification.
+  These predictions are used to create task-derived IQA labels without using
+  training-set memorization.
+
+target_key: "pirads_ge4"
+num_classes: 2
+
+class_names:
+  0: "pirads_lt4"
+  1: "pirads_ge4"
+
+image_keys:
+  - dwi
+  - adc
+  - t2
+  - prostate_mask
+
+cross_validation:
+  num_folds: 5
+  split_level: "patient"
+  stratify_key: "pirads_ge4"
+  seed: 42
+
+model:
+  name: "densenet121"
+  spatial_dims: 3
+  in_channels: 4
+  out_channels: 2
+
+training:
+  epochs: 60
+  batch_size: 2
+  learning_rate: 0.00001
+  weight_decay: 0.00001
+  use_weighted_sampler: true
+  best_metric: "val_auc"
+  best_metric_mode: "max"
+
+preprocessing:
+  roi_size:
+    - 160
+    - 160
+    - 64
+  normalize: "percentile"
+  percentile_lower: 1
+  percentile_upper: 99
+  crop_mode: "prostate_mask_if_available"
+
+output:
+  run_dir: "runs/oof_pirads_ge4"
+  oof_predictions_csv: "runs/oof_pirads_ge4/oof_predictions.csv"
+  fold_metrics_csv: "runs/oof_pirads_ge4/fold_metrics.csv"

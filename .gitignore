@@ -1,0 +1,7 @@
+configs/paths.local.yaml
+data/processed/
+runs/
+reports/qc/
+*.pt
+*.pth
+__pycache__/

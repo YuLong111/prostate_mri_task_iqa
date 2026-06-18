@@ -1,0 +1,13 @@
+task_name: "pirads_ge4"
+target_key: "pirads_ge4"
+num_classes: 2
+image_keys:
+  - dwi
+  - adc
+  - t2
+  - prostate_mask
+metrics:
+  - auc
+  - accuracy
+  - sensitivity
+  - specificity

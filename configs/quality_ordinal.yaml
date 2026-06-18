@@ -1,0 +1,12 @@
+task_name: "task_based_quality"
+target_key: "quality_ternary"
+num_classes: 3
+class_names:
+  0: "reject"
+  1: "caution"
+  2: "accept"
+image_keys:
+  - dwi
+  - adc
+  - t2
+  - prostate_mask

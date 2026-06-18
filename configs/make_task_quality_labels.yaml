@@ -1,0 +1,47 @@
+# configs/make_task_quality_labels.yaml
+
+task_name: "make_task_quality_labels"
+
+description: >
+  Convert downstream task prediction results into task-based IQA labels.
+  This is used when direct PI-QUAL or distortion labels are unavailable.
+
+source_task: "pirads_ge4"
+source_prediction_csv: "runs/oof_pirads_ge4/oof_predictions.csv"
+
+input_manifest: "data/manifests/master_manifest.csv"
+output_manifest: "data/manifests/master_manifest_with_task_quality.csv"
+
+classification_label_rules:
+  confidence_column: "confidence"
+  correct_column: "correct"
+
+  accept:
+    condition: "correct_and_confident"
+    confidence_min: 0.70
+    label: 2
+
+  reject:
+    condition: "incorrect_and_confident"
+    confidence_min: 0.70
+    label: 0
+
+  caution:
+    condition: "otherwise"
+    label: 1
+
+binary_label_rules:
+  create_binary_label: true
+  binary_column: "task_quality_bin"
+  accept_value: 1
+  reject_value: 0
+  caution_value: null
+
+output_columns:
+  ternary_quality_column: "quality_ternary"
+  binary_quality_column: "task_quality_bin"
+  task_correct_column: "task_correct"
+  task_confidence_column: "task_confidence"
+  quality_source_column: "quality_source"
+
+summary_output: "data/manifests/task_quality_label_summary.csv"

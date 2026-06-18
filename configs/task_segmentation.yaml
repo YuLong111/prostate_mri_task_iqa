@@ -1,0 +1,99 @@
+# configs/task_segmentation.yaml
+
+task_name: "lesion_segmentation"
+task_type: "segmentation"
+
+description: >
+  Downstream lesion segmentation task. The segmentation result will be used
+  to evaluate whether image quality affects spatial task performance.
+
+image_keys:
+  - dwi
+  - adc
+  - t2
+
+mask_key: "lesion_mask"
+
+auxiliary_mask_key: "prostate_mask"
+
+required_modalities:
+  - dwi
+  - t2
+  - lesion_mask
+
+optional_modalities:
+  - adc
+  - prostate_mask
+
+model:
+  name: "unet"
+  spatial_dims: 3
+  in_channels: 3
+  out_channels: 2
+  channels:
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+  strides:
+    - 2
+    - 2
+    - 2
+    - 2
+  num_res_units: 2
+
+training:
+  epochs: 150
+  batch_size: 1
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  loss: "dice_ce"
+  best_metric: "val_dice"
+  best_metric_mode: "max"
+  early_stopping_patience: 30
+
+preprocessing:
+  roi_size:
+    - 160
+    - 160
+    - 64
+  normalize: "percentile"
+  percentile_lower: 1
+  percentile_upper: 99
+  crop_mode: "prostate_mask_if_available"
+  resample_to_reference: "t2"
+  allow_missing_adc: true
+
+augmentation:
+  random_flip: true
+  random_affine: true
+  gaussian_noise: true
+  intensity_shift: true
+  intensity_scale: true
+
+metrics:
+  - dice
+  - iou
+  - average_surface_distance
+  - hausdorff_95
+
+quality_label_generation:
+  enabled: true
+  source: "segmentation_performance"
+
+  accept:
+    dice_min: 0.75
+    hausdorff95_max: 10.0
+
+  reject:
+    dice_max: 0.50
+    hausdorff95_min: 20.0
+
+  caution:
+    rule: "between_accept_and_reject"
+
+output:
+  run_dir: "runs/downstream_lesion_segmentation"
+  prediction_dir: "reports/predictions/segmentation_masks"
+  metrics_csv: "reports/tables/segmentation_metrics.csv"
