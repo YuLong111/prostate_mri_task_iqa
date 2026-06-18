@@ -1,0 +1,6 @@
+modality,available_count,missing_count,availability_percent,unique_patients_available,total_patient_scans
+t2,1027,224,82.09432454036771,627,1251
+dwi,1027,224,82.09432454036771,627,1251
+adc,0,1251,0.0,0,1251
+prostate_mask,1251,0,100.0,851,1251
+lesion_mask,0,1251,0.0,0,1251
