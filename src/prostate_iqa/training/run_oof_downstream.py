@@ -34,6 +34,8 @@ from prostate_iqa.utils.seed import set_global_seed
 PREDICTION_COLUMNS = (
     "patient_id",
     "scan_id",
+    "distortion_status",
+    "acquisition_id",
     "true_label",
     "pred_label",
     "prob_0",
@@ -289,6 +291,10 @@ def _predict_holdout(
         predictions_cpu = predictions.cpu().tolist()
         patient_ids = _batch_strings(batch, "patient_id", len(labels_cpu))
         scan_ids = _batch_strings(batch, "scan_id", len(labels_cpu))
+        distortion_statuses = _batch_strings(
+            batch, "distortion_status", len(labels_cpu)
+        )
+        acquisition_ids = _batch_strings(batch, "acquisition_id", len(labels_cpu))
         source_indices = torch.as_tensor(batch["source_index"]).cpu().tolist()
         for index, true_label in enumerate(labels_cpu):
             prob_0, prob_1 = probabilities_cpu[index]
@@ -297,6 +303,8 @@ def _predict_holdout(
                 {
                     "patient_id": patient_ids[index],
                     "scan_id": scan_ids[index],
+                    "distortion_status": distortion_statuses[index],
+                    "acquisition_id": acquisition_ids[index],
                     "true_label": int(true_label),
                     "pred_label": predicted,
                     "prob_0": float(prob_0),

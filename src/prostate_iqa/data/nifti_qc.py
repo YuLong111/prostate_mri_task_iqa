@@ -40,6 +40,8 @@ PERCENTILES = (1, 5, 50, 95, 99)
 QC_SUMMARY_COLUMNS = (
     "patient_id",
     "scan_id",
+    "distortion_status",
+    "acquisition_id",
     "case_output_dir",
     "status",
     "missing_modalities",
@@ -92,9 +94,10 @@ def _resolve_case_path(value: Any, modality: str, warnings_list: list[str]) -> P
     if ";" in text:
         paths = [item.strip() for item in text.split(";") if item.strip()]
         warnings_list.append(
-            f"{modality}: multiple paths were listed; using the first of {len(paths)}."
+            f"{modality}: {len(paths)} paths were listed in one field; skipped. "
+            "Rebuild the manifest so each acquisition has its own row."
         )
-        text = paths[0]
+        return None
     return Path(text).expanduser()
 
 
@@ -114,12 +117,11 @@ def _display_volume(
         return None
     if volume.ndim > 3:
         original_shape = tuple(int(value) for value in volume.shape)
-        while volume.ndim > 3:
-            volume = volume[..., 0]
         warnings_list.append(
-            f"{modality}: {original_shape} is greater than 3D; displayed index 0 "
-            "for trailing dimensions."
+            f"{modality}: {original_shape} is greater than 3D; no frame was "
+            "selected automatically. Split the acquisition into explicit 3D volumes."
         )
+        return None
     return volume
 
 
@@ -385,6 +387,8 @@ def _summary_row(case_summary: dict[str, Any], case_dir: Path) -> dict[str, Any]
     row: dict[str, Any] = {
         "patient_id": case_summary["patient_id"],
         "scan_id": case_summary["scan_id"],
+        "distortion_status": case_summary["distortion_status"],
+        "acquisition_id": case_summary["acquisition_id"],
         "case_output_dir": str(case_dir),
         "status": "warning" if case_summary["warnings"] else "ok",
         "missing_modalities": ";".join(case_summary["missing_modalities"]),
@@ -425,7 +429,12 @@ def process_case(
     """Load one case, save available QC artifacts, and return a CSV row."""
     patient_id = str(case.get("patient_id") or "")
     scan_id = str(case.get("scan_id") or "")
-    base_name = _safe_component(scan_id or patient_id, f"case_{case_index:05d}")
+    distortion_status = str(case.get("distortion_status") or "")
+    acquisition_id = str(case.get("acquisition_id") or "")
+    identity = acquisition_id or "_".join(
+        part for part in (scan_id or patient_id, distortion_status) if part
+    )
+    base_name = _safe_component(identity, f"case_{case_index:05d}")
     case_name = base_name
     if used_names is not None:
         suffix = 2
@@ -479,6 +488,8 @@ def process_case(
     case_summary = {
         "patient_id": patient_id,
         "scan_id": scan_id,
+        "distortion_status": distortion_status,
+        "acquisition_id": acquisition_id,
         "modalities": {
             modality: image.metadata if image is not None else None
             for modality, image in loaded.items()

@@ -33,6 +33,8 @@ from prostate_iqa.utils.seed import set_global_seed
 PREDICTION_COLUMNS = (
     "patient_id",
     "scan_id",
+    "distortion_status",
+    "acquisition_id",
     "true_label",
     "pred_label",
     "prob_0",
@@ -119,10 +121,17 @@ def _prepare_items(
     skipped: list[str] = []
     for index, source in enumerate(items):
         missing_keys = [key for key in image_keys if not _is_present(source.get(key))]
-        if missing_keys or not _is_present(source.get(target_key)):
+        ambiguous_keys = [
+            key for key in image_keys if ";" in str(source.get(key) or "")
+        ]
+        if missing_keys or ambiguous_keys or not _is_present(source.get(target_key)):
             reasons = []
             if missing_keys:
                 reasons.append("missing " + ", ".join(missing_keys))
+            if ambiguous_keys:
+                reasons.append(
+                    "multiple acquisitions in " + ", ".join(ambiguous_keys)
+                )
             if not _is_present(source.get(target_key)):
                 reasons.append(f"missing {target_key}")
             skipped.append(f"row {index}: {'; '.join(reasons)}")
@@ -259,6 +268,10 @@ def evaluate(
         predictions_cpu = predictions.detach().cpu().numpy()
         patient_ids = _batch_strings(batch, "patient_id", len(labels_cpu))
         scan_ids = _batch_strings(batch, "scan_id", len(labels_cpu))
+        distortion_statuses = _batch_strings(
+            batch, "distortion_status", len(labels_cpu)
+        )
+        acquisition_ids = _batch_strings(batch, "acquisition_id", len(labels_cpu))
         for index, true_label in enumerate(labels_cpu):
             predicted = int(predictions_cpu[index])
             prob_0 = float(probabilities_cpu[index, 0])
@@ -267,6 +280,8 @@ def evaluate(
                 {
                     "patient_id": patient_ids[index],
                     "scan_id": scan_ids[index],
+                    "distortion_status": distortion_statuses[index],
+                    "acquisition_id": acquisition_ids[index],
                     "true_label": int(true_label),
                     "pred_label": predicted,
                     "prob_0": prob_0,

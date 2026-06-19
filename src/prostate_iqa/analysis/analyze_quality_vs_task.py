@@ -122,24 +122,36 @@ def _identifier_columns(frame: pd.DataFrame) -> tuple[str, str]:
     return patient, scan
 
 
-def _add_identifiers(frame: pd.DataFrame) -> tuple[pd.DataFrame, str, str]:
+def _add_identifiers(
+    frame: pd.DataFrame,
+) -> tuple[pd.DataFrame, str, str, str | None]:
     """Add normalized merge keys and canonical display identifiers."""
     patient_column, scan_column = _identifier_columns(frame)
     result = frame.copy()
     result["_patient_key"] = result[patient_column].map(_patient_key)
     result["_scan_key"] = result[scan_column].map(_scan_key)
+    acquisition_column = _find_column(
+        result,
+        ("acquisition_id", "acquisitionid", "volume_id", "distortion_status"),
+    )
+    result["_acquisition_key"] = (
+        result[acquisition_column].map(_scan_key)
+        if acquisition_column is not None
+        else ""
+    )
     if (result["_patient_key"] == "").any() or (result["_scan_key"] == "").any():
         raise ValueError("Patient and scan identifiers cannot be missing.")
-    return result, patient_column, scan_column
+    return result, patient_column, scan_column, acquisition_column
 
 
 def _assert_unique(frame: pd.DataFrame, source_name: str) -> None:
     """Reject duplicate case rows before one-to-one merging."""
-    duplicated = frame.duplicated(["_patient_key", "_scan_key"], keep=False)
+    keys = ["_patient_key", "_scan_key", "_acquisition_key"]
+    duplicated = frame.duplicated(keys, keep=False)
     if duplicated.any():
-        examples = frame.loc[duplicated, ["_patient_key", "_scan_key"]].head(5)
+        examples = frame.loc[duplicated, keys].head(5)
         raise ValueError(
-            f"{source_name} contains duplicate patient/scan rows: "
+            f"{source_name} contains duplicate acquisition rows: "
             + examples.to_dict("records").__repr__()
         )
 
@@ -207,18 +219,22 @@ def _prefixed_source_columns(
     frame: pd.DataFrame,
     patient_column: str,
     scan_column: str,
+    acquisition_column: str | None,
     prefix: str,
 ) -> pd.DataFrame:
     """Preserve source columns with a namespace to prevent merge collisions."""
     result = pd.DataFrame(index=frame.index)
     result["_patient_key"] = frame["_patient_key"]
     result["_scan_key"] = frame["_scan_key"]
+    result["_acquisition_key"] = frame["_acquisition_key"]
     for column in frame.columns:
         if column not in {
             patient_column,
             scan_column,
+            acquisition_column,
             "_patient_key",
             "_scan_key",
+            "_acquisition_key",
         }:
             result[f"{prefix}_{column}"] = frame[column]
     return result
@@ -226,7 +242,7 @@ def _prefixed_source_columns(
 
 def _standardize_quality(frame: pd.DataFrame) -> pd.DataFrame:
     """Create canonical quality fields while retaining original columns."""
-    source, patient_column, scan_column = _add_identifiers(frame)
+    source, patient_column, scan_column, acquisition_column = _add_identifiers(frame)
     _assert_unique(source, "quality predictions")
     predicted_column = _find_column(
         source,
@@ -252,10 +268,12 @@ def _standardize_quality(frame: pd.DataFrame) -> pd.DataFrame:
     entropy_column = _find_column(source, ("entropy", "quality_entropy"))
 
     result = _prefixed_source_columns(
-        source, patient_column, scan_column, "quality_source"
+        source, patient_column, scan_column, acquisition_column, "quality_source"
     )
     result["patient_id"] = source[patient_column].map(_clean_id)
     result["scan_id"] = source[scan_column].map(_clean_id)
+    if acquisition_column is not None:
+        result["acquisition_id"] = source[acquisition_column].map(_clean_id)
     assert predicted_column is not None
     result["predicted_quality"] = source[predicted_column].map(_parse_quality).astype(
         "Int64"
@@ -284,7 +302,7 @@ def _standardize_quality(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _standardize_task(frame: pd.DataFrame) -> pd.DataFrame:
     """Create canonical downstream binary-classification fields."""
-    source, patient_column, scan_column = _add_identifiers(frame)
+    source, patient_column, scan_column, acquisition_column = _add_identifiers(frame)
     _assert_unique(source, "task predictions")
     true_column = _find_column(
         source,
@@ -305,7 +323,9 @@ def _standardize_task(frame: pd.DataFrame) -> pd.DataFrame:
         ("confidence", "task_confidence", "max_probability"),
     )
 
-    result = _prefixed_source_columns(source, patient_column, scan_column, "task_source")
+    result = _prefixed_source_columns(
+        source, patient_column, scan_column, acquisition_column, "task_source"
+    )
     result["task_true_label"] = _binary_series(source, true_column)
     result["task_pred_label"] = _binary_series(source, predicted_column)
     result["task_probability"] = _numeric_series(source, probability_column)
@@ -362,7 +382,7 @@ def _standardize_task(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _standardize_novelty(frame: pd.DataFrame) -> pd.DataFrame:
     """Create a canonical novelty-distance table."""
-    source, patient_column, scan_column = _add_identifiers(frame)
+    source, patient_column, scan_column, acquisition_column = _add_identifiers(frame)
     _assert_unique(source, "novelty scores")
     distance_column = _find_column(
         source,
@@ -370,7 +390,7 @@ def _standardize_novelty(frame: pd.DataFrame) -> pd.DataFrame:
         required=True,
     )
     result = _prefixed_source_columns(
-        source, patient_column, scan_column, "novelty_source"
+        source, patient_column, scan_column, acquisition_column, "novelty_source"
     )
     result["novelty_distance"] = _numeric_series(source, distance_column)
     return result
@@ -378,10 +398,14 @@ def _standardize_novelty(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _standardize_segmentation(frame: pd.DataFrame) -> pd.DataFrame:
     """Create canonical Dice/IoU/ASD/95HD columns."""
-    source, patient_column, scan_column = _add_identifiers(frame)
+    source, patient_column, scan_column, acquisition_column = _add_identifiers(frame)
     _assert_unique(source, "segmentation metrics")
     result = _prefixed_source_columns(
-        source, patient_column, scan_column, "segmentation_source"
+        source,
+        patient_column,
+        scan_column,
+        acquisition_column,
+        "segmentation_source",
     )
     found = 0
     for metric, aliases in SEGMENTATION_ALIASES.items():
@@ -672,7 +696,7 @@ def run_analysis(args: argparse.Namespace) -> dict[str, Path]:
     task = _standardize_task(read_csv(args.task_predictions_csv))
     merged = quality.merge(
         task,
-        on=["_patient_key", "_scan_key"],
+        on=["_patient_key", "_scan_key", "_acquisition_key"],
         how="inner",
         validate="one_to_one",
     )
@@ -687,7 +711,7 @@ def run_analysis(args: argparse.Namespace) -> dict[str, Path]:
         novelty = _standardize_novelty(read_csv(args.novelty_csv))
         merged = merged.merge(
             novelty,
-            on=["_patient_key", "_scan_key"],
+            on=["_patient_key", "_scan_key", "_acquisition_key"],
             how="left",
             validate="one_to_one",
         )
@@ -697,16 +721,18 @@ def run_analysis(args: argparse.Namespace) -> dict[str, Path]:
         )
         merged = merged.merge(
             segmentation,
-            on=["_patient_key", "_scan_key"],
+            on=["_patient_key", "_scan_key", "_acquisition_key"],
             how="left",
             validate="one_to_one",
         )
 
     quality_summary = build_quality_summary(merged)
     novelty_summary = build_novelty_summary(merged)
-    merged = merged.drop(columns=["_patient_key", "_scan_key"])
+    merged = merged.drop(columns=["_patient_key", "_scan_key", "_acquisition_key"])
     leading_columns = [
-        column for column in ("patient_id", "scan_id") if column in merged.columns
+        column
+        for column in ("patient_id", "scan_id", "acquisition_id")
+        if column in merged.columns
     ]
     merged = merged[
         leading_columns

@@ -15,7 +15,7 @@ import pandas as pd
 import SimpleITK as sitk
 
 from prostate_iqa.utils.io import ensure_dir, read_csv, read_json, write_csv, write_json
-from prostate_iqa.utils.logging import get_logger
+from prostate_iqa.utils.logging import close_file_handlers, get_logger
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -25,7 +25,15 @@ MASK_MODALITIES = ("prostate_mask",)
 MODALITIES = (*IMAGE_MODALITIES, *MASK_MODALITIES)
 DEFAULT_SPACING = (0.5, 0.5, 1.0)
 DEFAULT_ROI_SIZE = (160, 160, 64)
-FAILURE_COLUMNS = ("patient_id", "scan_id", "split", "error", "warnings")
+FAILURE_COLUMNS = (
+    "patient_id",
+    "scan_id",
+    "distortion_status",
+    "acquisition_id",
+    "split",
+    "error",
+    "warnings",
+)
 
 
 def _safe_component(value: Any, fallback: str) -> str:
@@ -46,17 +54,16 @@ def _source_path(
     modality: str,
     warnings_list: list[str],
 ) -> Path | None:
-    """Resolve one source path and handle defensive semicolon path lists."""
+    """Resolve one source path, rejecting legacy collapsed path lists."""
     if not _is_present(value):
         return None
     text = str(value).strip()
     if ";" in text:
-        candidates = [item.strip() for item in text.split(";") if item.strip()]
-        warnings_list.append(
-            f"{modality}: multiple source paths listed; using the first of "
-            f"{len(candidates)}."
+        raise ValueError(
+            f"{modality}: multiple paths are stored in one manifest cell. "
+            "Rebuild the inventory and master manifest so every acquisition "
+            "has its own row."
         )
-        text = candidates[0]
     return Path(text).expanduser()
 
 
@@ -65,21 +72,12 @@ def _ensure_3d(
     modality: str,
     warnings_list: list[str],
 ) -> sitk.Image:
-    """Extract index zero from trailing dimensions of a higher-dimensional image."""
-    original_size = tuple(int(value) for value in image.GetSize())
-    while image.GetDimension() > 3:
-        size = list(image.GetSize())
-        index = [0] * image.GetDimension()
-        size[-1] = 0
-        image = sitk.Extract(image, size, index)
-    if len(original_size) > 3:
-        warnings_list.append(
-            f"{modality}: source size {original_size} is greater than 3D; "
-            "using index 0 for trailing dimensions."
-        )
+    """Require one physical 3D volume per manifest row."""
     if image.GetDimension() != 3:
         raise ValueError(
-            f"{modality}: expected a 3D image, got {image.GetDimension()}D."
+            f"{modality}: expected one 3D volume per manifest row, got "
+            f"{image.GetDimension()}D with size {tuple(image.GetSize())}. "
+            "Split 4D NIfTI files into separate 3D acquisitions first."
         )
     return image
 
@@ -289,9 +287,9 @@ def _normalize_image(
 def _infer_split(datalist_path: Path) -> str:
     """Infer a split name from the standard datalist filename."""
     name = datalist_path.name.lower()
-    if "test" in name:
+    if "test_locked" in name or re.search(r"(?:^|[_-])test(?:[_\-.]|$)", name):
         return "test_locked"
-    if "val" in name or "valid" in name:
+    if re.search(r"(?:^|[_-])val(?:idation)?(?:[_\-.]|$)", name):
         return "val"
     if "train" in name:
         return "train"
@@ -353,8 +351,14 @@ def preprocess_case(
     patient_id = str(case.get("patient_id") or "")
     scan_id = str(case.get("scan_id") or "")
     patient_name = _safe_component(patient_id, f"patient_{case_index:05d}")
-    scan_name = _safe_component(scan_id, f"scan_{case_index:05d}")
-    case_dir = ensure_dir(out_root / split / f"{patient_name}_{scan_name}")
+    acquisition_value = case.get("acquisition_id")
+    if not _is_present(acquisition_value):
+        status = str(case.get("distortion_status") or "unknown")
+        acquisition_value = f"{scan_id}__{status}"
+    acquisition_name = _safe_component(
+        acquisition_value, f"acquisition_{case_index:05d}"
+    )
+    case_dir = ensure_dir(out_root / split / f"{patient_name}_{acquisition_name}")
     output_paths = _output_paths(case_dir)
     warnings_list: list[str] = []
 
@@ -486,6 +490,8 @@ def preprocess_case(
         failure = {
             "patient_id": patient_id,
             "scan_id": scan_id,
+            "distortion_status": str(case.get("distortion_status") or ""),
+            "acquisition_id": str(case.get("acquisition_id") or ""),
             "split": split,
             "error": str(error),
             "warnings": " | ".join(warnings_list),
@@ -534,6 +540,14 @@ def _merge_rows(
     if len(existing_keys) == len(keys):
         combined = combined.drop_duplicates(list(keys), keep="last")
     return combined
+
+
+def _json_records(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    """Return JSON-safe records, converting pandas missing values to ``None``."""
+    if frame.empty:
+        return []
+    clean = frame.astype(object).where(pd.notna(frame), None)
+    return clean.to_dict(orient="records")
 
 
 def _parse_bool(value: str | bool) -> bool:
@@ -638,19 +652,46 @@ def main(argv: Sequence[str] | None = None) -> int:
     manifest = _merge_rows(
         manifest_path,
         manifest_rows,
-        keys=("split", "patient_id", "scan_id"),
+        keys=(
+            "split",
+            "patient_id",
+            "scan_id",
+            "distortion_status",
+            "acquisition_id",
+        ),
     )
     write_csv(manifest, manifest_path)
+    if "split" in manifest.columns:
+        for split_name, split_frame in manifest.groupby("split", dropna=False):
+            normalized_split = str(split_name or "unknown")
+            filename = (
+                "datalist_test_locked.json"
+                if normalized_split == "test_locked"
+                else f"datalist_{normalized_split}.json"
+            )
+            write_json(_json_records(split_frame.reset_index(drop=True)), out_root / filename)
 
     failures_path = out_root / "preprocessing_failures.csv"
     failures = _merge_rows(
         failures_path,
         failure_rows,
-        keys=("split", "patient_id", "scan_id"),
+        keys=(
+            "split",
+            "patient_id",
+            "scan_id",
+            "distortion_status",
+            "acquisition_id",
+        ),
     )
     if manifest_rows and not failures.empty:
         successful_keys = {
-            (row.get("split"), row.get("patient_id"), row.get("scan_id"))
+            (
+                row.get("split"),
+                row.get("patient_id"),
+                row.get("scan_id"),
+                row.get("distortion_status"),
+                row.get("acquisition_id"),
+            )
             for row in manifest_rows
         }
         keep = failures.apply(
@@ -658,6 +699,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 row.get("split"),
                 row.get("patient_id"),
                 row.get("scan_id"),
+                row.get("distortion_status"),
+                row.get("acquisition_id"),
             )
             not in successful_keys,
             axis=1,
@@ -676,6 +719,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         manifest_path,
         failures_path,
     )
+    close_file_handlers(logger)
     return 0 if not failure_rows else 1
 
 

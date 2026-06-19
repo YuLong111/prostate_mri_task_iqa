@@ -32,6 +32,16 @@ def get_logger(name: str, log_file: PathType | None = None) -> logging.Logger:
     if log_file is not None:
         file_path = Path(log_file).expanduser().resolve()
         ensure_dir(file_path.parent)
+        # A named logger is process-global. Close stale file handlers when the
+        # same command is invoked again with a different output directory;
+        # otherwise Windows keeps the former log file (and its folder) locked.
+        for handler in list(logger.handlers):
+            if (
+                isinstance(handler, logging.FileHandler)
+                and Path(handler.baseFilename).resolve() != file_path
+            ):
+                logger.removeHandler(handler)
+                handler.close()
         existing_files = {
             Path(handler.baseFilename).resolve()
             for handler in logger.handlers
@@ -43,3 +53,11 @@ def get_logger(name: str, log_file: PathType | None = None) -> logging.Logger:
             logger.addHandler(file_handler)
 
     return logger
+
+
+def close_file_handlers(logger: logging.Logger) -> None:
+    """Flush, detach, and close file handlers owned by ``logger``."""
+    for handler in list(logger.handlers):
+        if isinstance(handler, logging.FileHandler):
+            logger.removeHandler(handler)
+            handler.close()

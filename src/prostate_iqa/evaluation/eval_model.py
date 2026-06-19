@@ -30,6 +30,9 @@ from prostate_iqa.utils.io import read_json, write_csv, write_json
 METADATA_COLUMNS = (
     "patient_id",
     "scan_id",
+    "distortion_status",
+    "acquisition_id",
+    "acquisition_index",
     "site",
     "vendor",
     "b_value",
@@ -124,10 +127,17 @@ def _prepare_items(
     skipped: list[str] = []
     for index, source in enumerate(items):
         missing_images = [key for key in image_keys if not _is_present(source.get(key))]
-        if missing_images or not _is_present(source.get(target_key)):
+        ambiguous_images = [
+            key for key in image_keys if ";" in str(source.get(key) or "")
+        ]
+        if missing_images or ambiguous_images or not _is_present(source.get(target_key)):
             reasons = []
             if missing_images:
                 reasons.append("missing " + ", ".join(missing_images))
+            if ambiguous_images:
+                reasons.append(
+                    "multiple acquisitions in " + ", ".join(ambiguous_images)
+                )
             if not _is_present(source.get(target_key)):
                 reasons.append(f"missing {target_key}")
             skipped.append(f"row {index}: {'; '.join(reasons)}")

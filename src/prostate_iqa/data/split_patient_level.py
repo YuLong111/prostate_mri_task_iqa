@@ -313,9 +313,17 @@ def save_splits(
     manifest: pd.DataFrame,
     split_patients: Mapping[str, set[str]],
     out_dir: Path,
+    overwrite_locked_test: bool = False,
 ) -> pd.DataFrame:
     """Save split JSON files and the row-level split summary CSV."""
     output_dir = ensure_dir(out_dir)
+    locked_path = output_dir / "datalist_test_locked.json"
+    if locked_path.is_file() and not overwrite_locked_test:
+        raise FileExistsError(
+            f"Locked test split already exists: {locked_path}. Refusing to replace "
+            "it. Use a new --out_dir, or pass --overwrite_locked_test only when "
+            "intentionally establishing a new experimental split."
+        )
     split_manifest = assign_split_column(manifest, split_patients)
 
     json_names = {
@@ -407,6 +415,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Optional patient-level stratification column.",
     )
+    parser.add_argument(
+        "--overwrite_locked_test",
+        action="store_true",
+        help=(
+            "Explicitly permit replacement of an existing locked test JSON. "
+            "Do not use this after model development has started."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -427,7 +443,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         stratify_key=args.stratify_key,
     )
-    split_manifest = save_splits(manifest, split_sets, out_dir)
+    split_manifest = save_splits(
+        manifest,
+        split_sets,
+        out_dir,
+        overwrite_locked_test=args.overwrite_locked_test,
+    )
     assert_no_patient_leakage(
         {
             name: set(

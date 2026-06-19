@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -11,7 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from prostate_iqa.utils.io import read_csv, write_csv
+from prostate_iqa.utils.io import read_csv, write_csv, write_json
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -119,8 +120,11 @@ def _quality_name(value: Any) -> str | None:
     return QUALITY_NAMES.get(int(numeric))
 
 
-def _identifier_columns(frame: pd.DataFrame) -> tuple[str, str]:
-    """Locate required patient and scan identifier columns."""
+CaseKey = tuple[str, str, str]
+
+
+def _identifier_columns(frame: pd.DataFrame) -> tuple[str, str, str | None]:
+    """Locate patient, scan, and optional acquisition identifier columns."""
     patient_column = _find_column(
         frame,
         ("patient_id", "patientid", "patient", "case_id", "subject_id"),
@@ -132,7 +136,26 @@ def _identifier_columns(frame: pd.DataFrame) -> tuple[str, str]:
         required=True,
     )
     assert patient_column is not None and scan_column is not None
-    return patient_column, scan_column
+    acquisition_column = _find_column(
+        frame,
+        ("acquisition_id", "acquisitionid", "volume_id", "distortion_status"),
+    )
+    return patient_column, scan_column, acquisition_column
+
+
+def _case_key(
+    row: pd.Series,
+    patient_column: str,
+    scan_column: str,
+    acquisition_column: str | None,
+) -> CaseKey:
+    """Build a normalized key that distinguishes physical acquisitions."""
+    acquisition = (
+        _scan_key(row[acquisition_column])
+        if acquisition_column is not None and _is_present(row[acquisition_column])
+        else ""
+    )
+    return (_patient_key(row[patient_column]), _scan_key(row[scan_column]), acquisition)
 
 
 def _classification_records(
@@ -140,9 +163,9 @@ def _classification_records(
     task_name: str,
     accept_confidence: float,
     reject_confidence: float,
-) -> dict[tuple[str, str], dict[str, Any]]:
+) -> dict[CaseKey, dict[str, Any]]:
     """Convert classification predictions to task-quality records."""
-    patient_column, scan_column = _identifier_columns(predictions)
+    patient_column, scan_column, acquisition_column = _identifier_columns(predictions)
     correct_column = _find_column(predictions, ("correct", "task_correct"))
     true_column = _find_column(
         predictions,
@@ -169,10 +192,10 @@ def _classification_records(
             "Classification predictions need confidence, or prob_0 and prob_1."
         )
 
-    records: dict[tuple[str, str], dict[str, Any]] = {}
+    records: dict[CaseKey, dict[str, Any]] = {}
     for row_index, row in predictions.iterrows():
-        key = (_patient_key(row[patient_column]), _scan_key(row[scan_column]))
-        if not all(key):
+        key = _case_key(row, patient_column, scan_column, acquisition_column)
+        if not key[0] or not key[1]:
             raise ValueError(f"Prediction row {row_index} has missing patient/scan ID.")
 
         if correct_column is not None:
@@ -231,9 +254,9 @@ def _segmentation_records(
     dice_reject: float,
     hd95_accept: float,
     hd95_reject: float,
-) -> dict[tuple[str, str], dict[str, Any]]:
+) -> dict[CaseKey, dict[str, Any]]:
     """Convert per-scan Dice/95HD results to task-quality records."""
-    patient_column, scan_column = _identifier_columns(metrics)
+    patient_column, scan_column, acquisition_column = _identifier_columns(metrics)
     dice_column = _find_column(
         metrics,
         ("dice", "dice_score", "mean_dice", "val_dice"),
@@ -245,10 +268,10 @@ def _segmentation_records(
     )
     assert dice_column is not None
 
-    records: dict[tuple[str, str], dict[str, Any]] = {}
+    records: dict[CaseKey, dict[str, Any]] = {}
     for row_index, row in metrics.iterrows():
-        key = (_patient_key(row[patient_column]), _scan_key(row[scan_column]))
-        if not all(key):
+        key = _case_key(row, patient_column, scan_column, acquisition_column)
+        if not key[0] or not key[1]:
             raise ValueError(f"Metric row {row_index} has missing patient/scan ID.")
         dice = _numeric(row[dice_column])
         hd95 = _numeric(row[hd95_column]) if hd95_column is not None else None
@@ -293,19 +316,19 @@ def _values_equal(left: Any, right: Any) -> bool:
 
 
 def _store_unique(
-    records: dict[tuple[str, str], dict[str, Any]],
-    key: tuple[str, str],
+    records: dict[CaseKey, dict[str, Any]],
+    key: CaseKey,
     record: dict[str, Any],
     row_index: Any,
 ) -> None:
-    """Store one task result per patient/scan and reject conflicts."""
+    """Store one task result per acquisition and reject conflicts."""
     existing = records.get(key)
     if existing is not None and any(
         not _values_equal(existing[column], value)
         for column, value in record.items()
     ):
         raise ValueError(
-            f"Conflicting task results for patient/scan {key} at row {row_index}."
+            f"Conflicting task results for acquisition {key} at row {row_index}."
         )
     records[key] = record
 
@@ -322,10 +345,10 @@ def _combine_without_overwrite(existing: pd.Series, derived: pd.Series) -> pd.Se
 
 def apply_quality_records(
     manifest: pd.DataFrame,
-    records: Mapping[tuple[str, str], Mapping[str, Any]],
+    records: Mapping[CaseKey, Mapping[str, Any]],
 ) -> pd.DataFrame:
     """Add task labels while preserving all original manifest values."""
-    patient_column, scan_column = _identifier_columns(manifest)
+    patient_column, scan_column, acquisition_column = _identifier_columns(manifest)
     result = manifest.copy()
     original_quality = result.get(
         "quality_ternary",
@@ -345,7 +368,7 @@ def apply_quality_records(
         "task_hd95": None,
     }
     for _, row in result.iterrows():
-        key = (_patient_key(row[patient_column]), _scan_key(row[scan_column]))
+        key = _case_key(row, patient_column, scan_column, acquisition_column)
         derived_rows.append(dict(records.get(key, empty_record)))
     derived = pd.DataFrame(derived_rows, index=result.index)
 
@@ -444,6 +467,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     source.add_argument("--segmentation_metrics_csv", type=Path)
     parser.add_argument("--task_name", required=True)
     parser.add_argument("--out_csv", type=Path, required=True)
+    parser.add_argument(
+        "--split",
+        default=None,
+        help=(
+            "Optional split value (for example train or val). Filtering before "
+            "label generation keeps the emitted JSON safe for direct training use."
+        ),
+    )
     parser.add_argument("--accept_confidence", type=_unit_interval, default=0.70)
     parser.add_argument("--reject_confidence", type=_unit_interval, default=0.70)
     parser.add_argument("--dice_accept", type=_unit_interval, default=0.75)
@@ -462,6 +493,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("hd95_accept must be lower than hd95_reject.")
 
     manifest = read_csv(args.manifest_csv)
+    if args.split is not None:
+        if "split" not in manifest.columns:
+            raise ValueError("--split was supplied but the manifest has no split column.")
+        requested_split = str(args.split).strip().lower()
+        manifest = manifest.loc[
+            manifest["split"].astype(str).str.strip().str.lower().eq(requested_split)
+        ].reset_index(drop=True)
+        if manifest.empty:
+            raise ValueError(f"No manifest rows found for split {args.split!r}.")
     if args.segmentation_metrics_csv is not None:
         task_type = "segmentation"
         metrics = read_csv(args.segmentation_metrics_csv)
@@ -485,6 +525,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     labeled = apply_quality_records(manifest, records)
     output_path = write_csv(labeled, args.out_csv)
+    json_path = Path(args.out_csv).with_suffix(".json")
+    write_json(json.loads(labeled.to_json(orient="records")), json_path)
     summary = build_label_summary(labeled, args.task_name, task_type)
     summary_path = write_csv(summary, SUMMARY_CSV)
 
@@ -493,6 +535,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         labeled["task_quality_label_name"].value_counts().sort_index().to_dict()
     )
     print(f"Saved task-labeled manifest to: {output_path}")
+    print(f"Saved task-labeled datalist to: {json_path}")
     print(f"Saved task-quality summary to: {summary_path}")
     print(f"Matched {matched:,} of {len(labeled):,} manifest rows.")
     print(f"Task-quality distribution: {distribution}")

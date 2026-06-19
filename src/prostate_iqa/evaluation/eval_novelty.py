@@ -30,6 +30,8 @@ from prostate_iqa.utils.io import write_csv
 OUTPUT_COLUMNS = (
     "patient_id",
     "scan_id",
+    "distortion_status",
+    "acquisition_id",
     "novelty_distance",
     "entropy",
     "confidence",
@@ -50,11 +52,18 @@ def _prepare_items(
     skipped: list[str] = []
     for index, source in enumerate(items):
         missing_images = [key for key in image_keys if not _is_present(source.get(key))]
+        ambiguous_images = [
+            key for key in image_keys if ";" in str(source.get(key) or "")
+        ]
         label_present = _is_present(source.get(target_key))
-        if missing_images or (require_label and not label_present):
+        if missing_images or ambiguous_images or (require_label and not label_present):
             reasons = []
             if missing_images:
                 reasons.append("missing " + ", ".join(missing_images))
+            if ambiguous_images:
+                reasons.append(
+                    "multiple acquisitions in " + ", ".join(ambiguous_images)
+                )
             if require_label and not label_present:
                 reasons.append(f"missing {target_key}")
             skipped.append(f"row {index}: {'; '.join(reasons)}")
@@ -66,6 +75,16 @@ def _prepare_items(
         )
         row["scan_id"] = (
             str(source["scan_id"]) if _is_present(source.get("scan_id")) else ""
+        )
+        row["distortion_status"] = (
+            str(source["distortion_status"])
+            if _is_present(source.get("distortion_status"))
+            else ""
+        )
+        row["acquisition_id"] = (
+            str(source["acquisition_id"])
+            if _is_present(source.get("acquisition_id"))
+            else ""
         )
         row["has_label"] = int(label_present)
         row["true_label"] = (
@@ -186,6 +205,10 @@ def extract_features(
             batch_size = int(images.shape[0])
             patient_ids = _batch_values(batch, "patient_id", batch_size)
             scan_ids = _batch_values(batch, "scan_id", batch_size)
+            distortion_statuses = _batch_values(
+                batch, "distortion_status", batch_size
+            )
+            acquisition_ids = _batch_values(batch, "acquisition_id", batch_size)
             has_labels = torch.as_tensor(batch["has_label"]).cpu().tolist()
             true_labels = torch.as_tensor(batch["true_label"]).cpu().tolist()
             predictions_cpu = predictions.cpu().tolist()
@@ -196,6 +219,8 @@ def extract_features(
                     {
                         "patient_id": str(patient_ids[index]),
                         "scan_id": str(scan_ids[index]),
+                        "distortion_status": str(distortion_statuses[index]),
+                        "acquisition_id": str(acquisition_ids[index]),
                         "entropy": float(entropy_cpu[index]),
                         "confidence": float(confidence_cpu[index]),
                         "predicted_class": int(predictions_cpu[index]),

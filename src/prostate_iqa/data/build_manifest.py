@@ -20,6 +20,11 @@ DEFAULT_INVENTORY_CSV = (
 DEFAULT_OUT_CSV = PROJECT_ROOT / "data" / "manifests" / "master_manifest.csv"
 
 PATH_COLUMNS = ("t2", "dwi", "adc", "prostate_mask", "lesion_mask")
+ACQUISITION_COLUMNS = (
+    "distortion_status",
+    "acquisition_index",
+    "acquisition_id",
+)
 LABEL_COLUMNS = (
     "pirads",
     "pirads_ge4",
@@ -34,7 +39,15 @@ LABEL_COLUMNS = (
     "b_value",
     "notes",
 )
-MANIFEST_COLUMNS = ("patient_id", "scan_id", *PATH_COLUMNS, *LABEL_COLUMNS)
+MANIFEST_COLUMNS = (
+    "patient_id",
+    "scan_id",
+    *ACQUISITION_COLUMNS,
+    *PATH_COLUMNS,
+    *LABEL_COLUMNS,
+)
+
+MEDICAL_VOLUME_SUFFIXES = (".nii.gz", ".nii", ".mha", ".mhd", ".nrrd")
 
 REQUIRED_INVENTORY_COLUMNS = {
     "file_path",
@@ -165,10 +178,38 @@ def _is_study_level_scan(value: Any) -> bool:
     )
 
 
-def _join_paths(values: pd.Series) -> str:
-    """Join unique paths deterministically without discarding duplicate entries."""
-    paths = sorted({_clean_id(value) for value in values if _is_present(value)})
-    return ";".join(paths)
+def _distortion_status(value: Any, file_path: Any = "") -> str:
+    """Normalize acquisition distortion groups, with a path-based fallback."""
+    text = _clean_id(value).lower().replace(" ", "_")
+    if text in {"distorted", "undistorted", "not_applicable"}:
+        return text
+    path_text = _clean_id(file_path).lower().replace("\\", "/")
+    if "undistorted" in path_text:
+        return "undistorted"
+    if "distorted" in path_text:
+        return "distorted"
+    return "unknown"
+
+
+def _is_medical_volume(row: pd.Series) -> bool:
+    """Exclude spreadsheets and sidecars from modality path columns."""
+    suffix = _clean_id(row.get("suffix")).lower()
+    if suffix:
+        return suffix in MEDICAL_VOLUME_SUFFIXES
+    path = _clean_id(row.get("file_path")).lower()
+    return path.endswith(MEDICAL_VOLUME_SUFFIXES)
+
+
+def _unique_paths(values: pd.Series) -> list[str]:
+    """Return every unique physical path in deterministic order."""
+    return sorted({_clean_id(value) for value in values if _is_present(value)})
+
+
+def _acquisition_id(scan_id: str, status: str, index: int) -> str:
+    """Create a stable identifier for one physical acquisition row."""
+    scan = re.sub(r"[^A-Za-z0-9._-]+", "_", scan_id).strip("._") or "scan"
+    value = f"{scan}__{status}"
+    return value if index == 0 else f"{value}__rep{index + 1}"
 
 
 def _guess_b_value(scan_id: str) -> int | None:
@@ -193,98 +234,171 @@ def _validate_inventory(inventory: pd.DataFrame) -> None:
         )
 
 
-def _paths_by_key(
+def _unique_path_map(
     inventory: pd.DataFrame,
     modality: str,
-) -> dict[tuple[str, str], str]:
-    """Collect paths for one modality keyed by canonical patient and scan."""
+    keys: Sequence[str],
+) -> dict[Any, str]:
+    """Return only unambiguous one-path modality mappings."""
     rows = inventory.loc[inventory["modality_guess"].eq(modality)]
-    result: dict[tuple[str, str], str] = {}
-    for key, group in rows.groupby(["_patient_key", "_scan_key"], sort=False):
-        result[key] = _join_paths(group["file_path"])
-    return result
-
-
-def _patient_mask_paths(
-    inventory: pd.DataFrame,
-    modality: str,
-) -> dict[str, str]:
-    """Return a patient mask only when exactly one unique mask is available."""
-    rows = inventory.loc[inventory["modality_guess"].eq(modality)]
-    result: dict[str, str] = {}
-    for patient_key, group in rows.groupby("_patient_key", sort=False):
-        paths = sorted({_clean_id(value) for value in group["file_path"]})
+    result: dict[Any, str] = {}
+    for raw_key, group in rows.groupby(list(keys), sort=False, dropna=False):
+        key = raw_key[0] if len(keys) == 1 and isinstance(raw_key, tuple) else raw_key
+        paths = _unique_paths(group["file_path"])
         if len(paths) == 1:
-            result[patient_key] = paths[0]
+            result[key] = paths[0]
     return result
 
 
 def build_manifest(inventory: pd.DataFrame) -> pd.DataFrame:
-    """Build one row per patient/scan, propagating a shared patient mask."""
+    """Build one row per physical acquisition without collapsing path variants."""
     _validate_inventory(inventory)
     files = inventory.copy()
+    files = files.loc[files.apply(_is_medical_volume, axis=1)].copy()
     files["patient_id_guess"] = files["patient_id_guess"].map(_clean_id)
     files["scan_id_guess"] = files["scan_id_guess"].map(_clean_id)
     files["_patient_key"] = files["patient_id_guess"].map(_patient_key)
     files["_scan_key"] = files["scan_id_guess"].map(_scan_key)
+    files["_study_key"] = files["scan_id_guess"].map(_study_key)
+    if "distortion_status" in files.columns:
+        files["_distortion_status"] = [
+            _distortion_status(status, path)
+            for status, path in zip(
+                files["distortion_status"], files["file_path"], strict=True
+            )
+        ]
+    else:
+        files["_distortion_status"] = files["file_path"].map(
+            lambda path: _distortion_status("", path)
+        )
     files = files.loc[files["_patient_key"].ne("")].copy()
     files.loc[files["_scan_key"].eq(""), "_scan_key"] = files["_patient_key"]
 
     image_modalities = {"t2", "dwi", "adc"}
     image_rows = files.loc[files["modality_guess"].isin(image_modalities)]
 
-    base_keys: list[tuple[str, str]] = list(
-        image_rows[["_patient_key", "_scan_key"]]
-        .drop_duplicates()
-        .itertuples(index=False, name=None)
-    )
-
-    patients_with_images = {patient_key for patient_key, _ in base_keys}
-    mask_rows = files.loc[
-        files["modality_guess"].isin({"prostate_mask", "lesion_mask"})
-        & ~files["_patient_key"].isin(patients_with_images)
-    ]
-    base_keys.extend(
-        mask_rows[["_patient_key", "_scan_key"]]
-        .drop_duplicates()
-        .itertuples(index=False, name=None)
-    )
-    base_keys = sorted(set(base_keys))
-
     display_patient = (
         files.drop_duplicates("_patient_key")
         .set_index("_patient_key")["patient_id_guess"]
         .to_dict()
     )
-    display_scan = (
-        files.drop_duplicates(["_patient_key", "_scan_key"])
-        .set_index(["_patient_key", "_scan_key"])["scan_id_guess"]
-        .to_dict()
-    )
-
-    exact_paths = {
-        modality: _paths_by_key(files, modality) for modality in PATH_COLUMNS
+    exact_masks = {
+        modality: _unique_path_map(
+            files, modality, ("_patient_key", "_scan_key")
+        )
+        for modality in ("prostate_mask", "lesion_mask")
+    }
+    study_masks = {
+        modality: _unique_path_map(
+            files.loc[files["_study_key"].ne("")],
+            modality,
+            ("_patient_key", "_study_key"),
+        )
+        for modality in ("prostate_mask", "lesion_mask")
     }
     patient_masks = {
-        modality: _patient_mask_paths(files, modality)
+        modality: _unique_path_map(files, modality, ("_patient_key",))
         for modality in ("prostate_mask", "lesion_mask")
+    }
+    study_images = {
+        modality: _unique_path_map(
+            image_rows.loc[image_rows["_study_key"].ne("")],
+            modality,
+            ("_patient_key", "_study_key", "_distortion_status"),
+        )
+        for modality in image_modalities
     }
 
     records: list[dict[str, Any]] = []
-    for patient_key, scan_key in base_keys:
-        key = (patient_key, scan_key)
-        record: dict[str, Any] = {
-            "patient_id": display_patient[patient_key],
-            "scan_id": display_scan.get(key, scan_key),
+    group_keys = ("_patient_key", "_scan_key", "_distortion_status")
+    for (patient_key, scan_key, status), group in image_rows.groupby(
+        list(group_keys), sort=True, dropna=False
+    ):
+        modality_paths = {
+            modality: _unique_paths(
+                group.loc[group["modality_guess"].eq(modality), "file_path"]
+            )
+            for modality in image_modalities
         }
-        for modality in PATH_COLUMNS:
-            path = exact_paths[modality].get(key, "")
-            if not path and modality in patient_masks:
-                path = patient_masks[modality].get(patient_key, "")
-            record[modality] = path
+        replicate_count = max((len(paths) for paths in modality_paths.values()), default=0)
+        if replicate_count == 0:
+            continue
+        display_scan_values = [
+            _clean_id(value) for value in group["scan_id_guess"] if _is_present(value)
+        ]
+        scan_id = display_scan_values[0] if display_scan_values else scan_key
+        study_key = _study_key(scan_id)
+        for acquisition_index in range(replicate_count):
+            record: dict[str, Any] = {
+                "patient_id": display_patient[patient_key],
+                "scan_id": scan_id,
+                "distortion_status": status,
+                "acquisition_index": acquisition_index,
+                "acquisition_id": _acquisition_id(
+                    scan_id, status, acquisition_index
+                ),
+            }
+            for modality in image_modalities:
+                paths = modality_paths[modality]
+                if len(paths) == 1:
+                    path = paths[0]
+                elif acquisition_index < len(paths):
+                    path = paths[acquisition_index]
+                else:
+                    path = ""
+                if not path and study_key:
+                    path = study_images[modality].get(
+                        (patient_key, study_key, status), ""
+                    )
+                record[modality] = path
+            for modality in ("prostate_mask", "lesion_mask"):
+                path = exact_masks[modality].get((patient_key, scan_key), "")
+                if not path and study_key:
+                    path = study_masks[modality].get(
+                        (patient_key, study_key), ""
+                    )
+                if not path:
+                    path = patient_masks[modality].get(patient_key, "")
+                record[modality] = path
+            for column in LABEL_COLUMNS:
+                record[column] = pd.NA
+            record["b_value"] = _guess_b_value(scan_id)
+            records.append(record)
+
+    # Preserve mask-only patients for QC while keeping them explicitly separate
+    # from distorted/undistorted image acquisitions.
+    patients_with_images = {
+        _patient_key(record["patient_id"]) for record in records
+    }
+    mask_rows = files.loc[
+        files["modality_guess"].isin({"prostate_mask", "lesion_mask"})
+        & ~files["_patient_key"].isin(patients_with_images)
+    ]
+    for (patient_key, scan_key), group in mask_rows.groupby(
+        ["_patient_key", "_scan_key"], sort=True
+    ):
+        scan_values = [
+            _clean_id(value) for value in group["scan_id_guess"] if _is_present(value)
+        ]
+        scan_id = scan_values[0] if scan_values else scan_key
+        record = {
+            "patient_id": display_patient[patient_key],
+            "scan_id": scan_id,
+            "distortion_status": "not_applicable",
+            "acquisition_index": 0,
+            "acquisition_id": _acquisition_id(scan_id, "not_applicable", 0),
+            "t2": "",
+            "dwi": "",
+            "adc": "",
+            "prostate_mask": exact_masks["prostate_mask"].get(
+                (patient_key, scan_key), ""
+            ),
+            "lesion_mask": exact_masks["lesion_mask"].get(
+                (patient_key, scan_key), ""
+            ),
+        }
         for column in LABEL_COLUMNS:
             record[column] = pd.NA
-        record["b_value"] = _guess_b_value(record["scan_id"])
         records.append(record)
 
     return pd.DataFrame(records, columns=MANIFEST_COLUMNS)
