@@ -22,9 +22,34 @@ from prostate_iqa.data.make_task_quality_labels import (
 )
 from prostate_iqa.data.preprocess_cases import main as preprocess_main
 from prostate_iqa.data.transforms import get_val_transforms
+from prostate_iqa.training.train_binary_task import _prepare_items
 
 
 class AcquisitionPipelineTests(unittest.TestCase):
+    def test_training_items_drop_uncollatable_unused_null_metadata(self) -> None:
+        prepared = _prepare_items(
+            [
+                {
+                    "patient_id": "P1",
+                    "scan_id": "S1",
+                    "acquisition_id": "S1__distorted",
+                    "distortion_status": "distorted",
+                    "dwi": "dwi.nii.gz",
+                    "prostate_mask": "mask.nii.gz",
+                    "pirads_ge4": 1,
+                    "adc": None,
+                    "site": None,
+                }
+            ],
+            ["dwi", "prostate_mask"],
+            "pirads_ge4",
+            "test",
+        )
+        self.assertEqual(len(prepared), 1)
+        self.assertNotIn("adc", prepared[0])
+        self.assertNotIn("site", prepared[0])
+        self.assertEqual(prepared[0]["label"], 1)
+
     def test_validation_transform_uses_complete_3d_volume(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

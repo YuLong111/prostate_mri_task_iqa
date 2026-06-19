@@ -189,6 +189,9 @@ def _make_loaders(
     sampler = _weighted_sampler(train_items, fold_seed)
     if sampler is not None:
         print("  Using inverse-frequency WeightedRandomSampler.")
+    drop_singleton = args.batch_size > 1 and len(train_items) % args.batch_size == 1
+    if drop_singleton:
+        print("  Dropping the final singleton training batch for BatchNorm stability.")
     train_loader = DataLoader(
         Dataset(list(train_items), transform=train_transform),
         batch_size=args.batch_size,
@@ -197,6 +200,7 @@ def _make_loaders(
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         generator=torch.Generator().manual_seed(fold_seed),
+        drop_last=drop_singleton,
     )
     holdout_loader = DataLoader(
         Dataset(list(holdout_items), transform=holdout_transform),

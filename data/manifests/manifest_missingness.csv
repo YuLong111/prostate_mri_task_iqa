@@ -1,6 +1,9 @@
 column,non_missing_count,missing_count,missing_percent
 patient_id,1251,0,0.0
 scan_id,1251,0,0.0
+distortion_status,1251,0,0.0
+acquisition_index,1251,0,0.0
+acquisition_id,1251,0,0.0
 t2,1027,224,17.905675459632295
 dwi,1027,224,17.905675459632295
 adc,0,1251,100.0

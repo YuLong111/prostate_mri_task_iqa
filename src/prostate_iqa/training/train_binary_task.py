@@ -120,6 +120,12 @@ def _prepare_items(
     prepared: list[dict[str, Any]] = []
     skipped: list[str] = []
     for index, source in enumerate(items):
+        quality_target = str(source.get("quality_target_key") or "").strip()
+        if quality_target and quality_target in image_keys:
+            raise ValueError(
+                f"Target leakage in {source_name} row {index}: segmentation target "
+                f"{quality_target!r} cannot also be an IQA image input."
+            )
         missing_keys = [key for key in image_keys if not _is_present(source.get(key))]
         ambiguous_keys = [
             key for key in image_keys if ";" in str(source.get(key) or "")
@@ -137,8 +143,15 @@ def _prepare_items(
             skipped.append(f"row {index}: {'; '.join(reasons)}")
             continue
 
-        item = dict(source)
-        item["label"] = _binary_label(item[target_key], target_key)
+        item = {key: source[key] for key in image_keys}
+        for key in (
+            "patient_id",
+            "scan_id",
+            "distortion_status",
+            "acquisition_id",
+        ):
+            item[key] = str(source[key]) if _is_present(source.get(key)) else ""
+        item["label"] = _binary_label(source[target_key], target_key)
         prepared.append(item)
 
     if skipped:
@@ -360,6 +373,9 @@ def train(args: argparse.Namespace) -> dict[str, float]:
     sampler = _weighted_sampler(train_items, args.seed)
     if sampler is not None:
         print("Using inverse-frequency WeightedRandomSampler for class imbalance.")
+    drop_singleton = args.batch_size > 1 and len(train_items) % args.batch_size == 1
+    if drop_singleton:
+        print("Dropping the final singleton training batch for BatchNorm stability.")
     loader_generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
         train_dataset,
@@ -369,6 +385,7 @@ def train(args: argparse.Namespace) -> dict[str, float]:
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
         generator=loader_generator,
+        drop_last=drop_singleton,
     )
     val_loader = DataLoader(
         val_dataset,

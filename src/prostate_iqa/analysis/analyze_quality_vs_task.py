@@ -693,18 +693,24 @@ def run_analysis(args: argparse.Namespace) -> dict[str, Path]:
     """Merge input tables, compute summaries, and save tables and plots."""
     output_dir = ensure_dir(args.out_dir)
     quality = _standardize_quality(read_csv(args.quality_predictions_csv))
-    task = _standardize_task(read_csv(args.task_predictions_csv))
-    merged = quality.merge(
-        task,
-        on=["_patient_key", "_scan_key", "_acquisition_key"],
-        how="inner",
-        validate="one_to_one",
-    )
+    merge_keys = ["_patient_key", "_scan_key", "_acquisition_key"]
+    task = None
+    segmentation = None
+    if args.task_predictions_csv is not None:
+        task = _standardize_task(read_csv(args.task_predictions_csv))
+        merged = quality.merge(task, on=merge_keys, how="inner", validate="one_to_one")
+    else:
+        segmentation = _standardize_segmentation(
+            read_csv(args.segmentation_metrics_csv)
+        )
+        merged = quality.merge(
+            segmentation, on=merge_keys, how="inner", validate="one_to_one"
+        )
     if merged.empty:
-        raise ValueError("Quality and task predictions have no matching patient/scan rows.")
+        raise ValueError("Quality and downstream results have no matching acquisitions.")
     print(
-        f"Matched {len(merged):,} cases from quality={len(quality):,} "
-        f"and task={len(task):,} rows."
+        f"Matched {len(merged):,} cases from quality={len(quality):,} and "
+        f"downstream={len(task) if task is not None else len(segmentation):,} rows."
     )
 
     if args.novelty_csv is not None:
@@ -715,16 +721,28 @@ def run_analysis(args: argparse.Namespace) -> dict[str, Path]:
             how="left",
             validate="one_to_one",
         )
-    if args.segmentation_metrics_csv is not None:
+    if args.segmentation_metrics_csv is not None and segmentation is None:
         segmentation = _standardize_segmentation(
             read_csv(args.segmentation_metrics_csv)
         )
         merged = merged.merge(
             segmentation,
-            on=["_patient_key", "_scan_key", "_acquisition_key"],
+            on=merge_keys,
             how="left",
             validate="one_to_one",
         )
+
+    # A standardized task-success view keeps group and novelty summaries usable
+    # for segmentation-only analyses without pretending Dice is a probability.
+    if "task_correct" not in merged:
+        dice = pd.to_numeric(merged.get("seg_dice"), errors="coerce")
+        merged["task_correct"] = (dice >= args.segmentation_success_dice).where(
+            dice.notna(), np.nan
+        )
+        merged["task_error"] = 1.0 - merged["task_correct"]
+    for column in ("task_true_label", "task_probability", "task_confidence"):
+        if column not in merged:
+            merged[column] = np.nan
 
     quality_summary = build_quality_summary(merged)
     novelty_summary = build_novelty_summary(merged)
@@ -763,16 +781,29 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description="Analyze predicted IQA quality against downstream performance."
     )
     parser.add_argument("--quality_predictions_csv", type=Path, required=True)
-    parser.add_argument("--task_predictions_csv", type=Path, required=True)
-    parser.add_argument("--novelty_csv", type=Path)
+    parser.add_argument("--task_predictions_csv", type=Path)
     parser.add_argument("--segmentation_metrics_csv", type=Path)
+    parser.add_argument("--novelty_csv", type=Path)
+    parser.add_argument(
+        "--segmentation_success_dice",
+        type=float,
+        default=0.75,
+        help="Dice threshold used only to summarize segmentation success/failure.",
+    )
     parser.add_argument("--out_dir", type=Path, required=True)
     return parser.parse_args(argv)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point."""
-    run_analysis(parse_args(argv))
+    args = parse_args(argv)
+    if args.task_predictions_csv is None and args.segmentation_metrics_csv is None:
+        raise ValueError(
+            "Provide --task_predictions_csv, --segmentation_metrics_csv, or both."
+        )
+    if not 0.0 <= args.segmentation_success_dice <= 1.0:
+        raise ValueError("segmentation_success_dice must be in [0, 1].")
+    run_analysis(args)
     return 0
 
 

@@ -21,7 +21,7 @@ from prostate_iqa.utils.logging import close_file_handlers, get_logger
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_OUT_DIR = PROJECT_ROOT / "data" / "processed"
 IMAGE_MODALITIES = ("t2", "dwi", "adc")
-MASK_MODALITIES = ("prostate_mask",)
+MASK_MODALITIES = ("prostate_mask", "lesion_mask")
 MODALITIES = (*IMAGE_MODALITIES, *MASK_MODALITIES)
 DEFAULT_SPACING = (0.5, 0.5, 1.0)
 DEFAULT_ROI_SIZE = (160, 160, 64)
@@ -318,6 +318,8 @@ def _record_for_case(
     warnings_list: list[str],
     spacing: tuple[float, float, float],
     roi_size: tuple[int, int, int],
+    crop_mode: str,
+    crop_mask_key: str,
     status: str,
 ) -> dict[str, Any]:
     """Build a preprocessing-manifest row while preserving labels/metadata."""
@@ -334,6 +336,8 @@ def _record_for_case(
     record["preprocessing_warnings"] = " | ".join(warnings_list)
     record["target_spacing"] = "x".join(f"{value:g}" for value in spacing)
     record["roi_size"] = "x".join(str(value) for value in roi_size)
+    record["crop_mode"] = crop_mode
+    record["crop_mask_key"] = crop_mask_key if crop_mode == "mask" else ""
     return record
 
 
@@ -343,6 +347,8 @@ def preprocess_case(
     split: str,
     spacing: tuple[float, float, float],
     roi_size: tuple[int, int, int],
+    crop_mode: str,
+    crop_mask_key: str,
     overwrite: bool,
     logger: logging.Logger,
     case_index: int,
@@ -381,6 +387,8 @@ def preprocess_case(
                 warnings_list,
                 spacing,
                 roi_size,
+                crop_mode,
+                crop_mask_key,
                 "skipped_existing",
             ),
             None,
@@ -389,7 +397,7 @@ def preprocess_case(
     try:
         images, missing = _load_images(case, warnings_list)
         if not images:
-            raise ValueError("No readable T2, DWI, ADC, or prostate mask was found.")
+            raise ValueError("No readable MRI image or segmentation mask was found.")
 
         if "t2" in images:
             reference_name = "t2"
@@ -400,9 +408,12 @@ def preprocess_case(
             reference_name = "adc"
             warnings_list.append("T2 and DWI missing: ADC used as the reference grid.")
         else:
-            reference_name = "prostate_mask"
+            reference_name = next(
+                (name for name in MASK_MODALITIES if name in images),
+                "prostate_mask",
+            )
             warnings_list.append(
-                "No intensity image available: prostate mask used as reference grid."
+                f"No intensity image available: {reference_name} used as reference grid."
             )
 
         target = _target_reference(images[reference_name], spacing)
@@ -416,17 +427,19 @@ def preprocess_case(
                 warnings_list=warnings_list,
             )
 
-        mask = aligned.get("prostate_mask")
-        center = _mask_center(mask) if mask is not None else None
-        if center is None:
+        crop_mask = aligned.get(crop_mask_key) if crop_mode == "mask" else None
+        center = _mask_center(crop_mask) if crop_mask is not None else None
+        if crop_mode == "center":
             center = _image_center(target)
-            if mask is None:
+        elif center is None:
+            center = _image_center(target)
+            if crop_mask is None:
                 warnings_list.append(
-                    "Prostate mask unavailable: used a center crop."
+                    f"{crop_mask_key} unavailable: used a center crop."
                 )
             else:
                 warnings_list.append(
-                    "Prostate mask is empty after resampling: used a center crop."
+                    f"{crop_mask_key} is empty after resampling: used a center crop."
                 )
 
         normalization: dict[str, Any] = {}
@@ -456,6 +469,8 @@ def preprocess_case(
             "reference_modality": reference_name,
             "target_spacing": list(spacing),
             "roi_size": list(roi_size),
+            "crop_mode": crop_mode,
+            "crop_mask_key": crop_mask_key if crop_mode == "mask" else None,
             "crop_center_index": list(center),
             "normalization_percentiles": normalization,
             "missing_modalities": missing,
@@ -481,6 +496,8 @@ def preprocess_case(
                 warnings_list,
                 spacing,
                 roi_size,
+                crop_mode,
+                crop_mask_key,
                 "processed",
             ),
             None,
@@ -596,6 +613,21 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Overwrite completed cases (default: false).",
     )
+    parser.add_argument(
+        "--crop_mode",
+        choices=("mask", "center"),
+        default="mask",
+        help=(
+            "Crop around --crop_mask_key or around the image center. Use center "
+            "when the mask is the downstream segmentation target."
+        ),
+    )
+    parser.add_argument(
+        "--crop_mask_key",
+        choices=MASK_MODALITIES,
+        default="prostate_mask",
+        help="Mask used only when --crop_mode mask (default: prostate_mask).",
+    )
     return parser.parse_args(argv)
 
 
@@ -639,6 +671,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             split,
             spacing,
             roi_size,
+            args.crop_mode,
+            args.crop_mask_key,
             args.overwrite,
             logger,
             index,

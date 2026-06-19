@@ -5,3 +5,5 @@ reports/qc/
 *.pt
 *.pth
 __pycache__/
+reports/
+data/
