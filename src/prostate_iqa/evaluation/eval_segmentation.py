@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from typing import Any
 
 import torch
 from monai.data import DataLoader, Dataset
@@ -12,7 +13,6 @@ from monai.data import DataLoader, Dataset
 from prostate_iqa.data.segmentation_transforms import get_segmentation_val_transforms
 from prostate_iqa.evaluation.eval_model import (
     _checkpoint_roi_size,
-    _extract_state_dict,
     _load_checkpoint,
     _load_datalist,
 )
@@ -22,6 +22,29 @@ from prostate_iqa.training.train_segmentation_task import (
     prepare_segmentation_items,
 )
 from prostate_iqa.utils.io import ensure_dir, write_csv, write_json
+
+
+def _extract_unet_state_dict(
+    checkpoint: Mapping[str, Any],
+) -> dict[str, torch.Tensor]:
+    """Extract UNet weights without stripping MONAI's real ``model.`` prefix."""
+    candidate: Mapping[str, Any] = checkpoint
+    for key in ("model_state_dict", "state_dict", "model_state", "network", "net"):
+        value = checkpoint.get(key)
+        if isinstance(value, Mapping):
+            candidate = value
+            break
+    state_dict = {
+        str(key): value
+        for key, value in candidate.items()
+        if isinstance(value, torch.Tensor)
+    }
+    if not state_dict:
+        raise ValueError("Checkpoint does not contain a tensor model state dictionary.")
+    for prefix in ("module.", "_orig_mod."):
+        if all(key.startswith(prefix) for key in state_dict):
+            state_dict = {key[len(prefix) :]: value for key, value in state_dict.items()}
+    return state_dict
 
 
 def evaluate(args: argparse.Namespace) -> dict[str, object]:
@@ -59,7 +82,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, object]:
         pin_memory=torch.cuda.is_available(),
     )
     model = build_unet3d(len(args.image_keys), 2)
-    model.load_state_dict(_extract_state_dict(checkpoint), strict=True)
+    model.load_state_dict(_extract_unet_state_dict(checkpoint), strict=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     prediction_dir = ensure_dir(args.prediction_dir) if args.prediction_dir else None

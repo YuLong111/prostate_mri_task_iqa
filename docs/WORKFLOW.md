@@ -135,11 +135,32 @@ python -m prostate_iqa.data.preprocess_cases `
 
 Role: loads each full 3D volume, aligns DWI/ADC/masks to the reference grid, resamples, crops around the prostate (or center-crops), robustly normalizes intensity images, and writes new NIfTIs. Masks use nearest-neighbor interpolation. Raw images are never changed.
 
+For a prostate- or lesion-segmentation downstream task, use a center crop so the
+ground-truth mask does not determine the model input crop:
+
+```powershell
+python -m prostate_iqa.data.preprocess_cases `
+  --datalist_json "$SplitDir/datalist_train.json" `
+  --out_dir $ProcessedDir `
+  --spacing 0.5 0.5 1.0 `
+  --roi_size 160 160 64 `
+  --crop_mode center
+```
+
+`--crop_mode mask` remains useful for classification/IQA experiments in which a
+prostate mask is an allowed localization input. Never crop around the target
+lesion mask when lesion segmentation is the task.
+
 Outputs include a cumulative `preprocessing_manifest.csv`, `preprocessing_failures.csv`, per-case summaries, and ready-to-train `datalist_train.json` / `datalist_val.json`. Distortion variants have distinct output directories.
 
 Only after every choice is frozen should the same command be applied to `datalist_test_locked.json`.
 
-## 8. Train the downstream clinical task
+## 8. Train one of the four downstream tasks
+
+The supported downstream paths are PI-RADS >= 4 classification, Gleason grade
+group >= 2 classification, prostate segmentation, and lesion segmentation.
+
+### 8a. Binary clinical classification
 
 Example for PI-RADS >= 4:
 
@@ -161,6 +182,34 @@ Use `gleason_ge2` for the Gleason task. Image keys may be reduced to modalities 
 
 Role: establishes the task whose success/failure will define quality. It trains a 3D DenseNet121 with class balancing and selects `best.pt` by validation AUC. It also writes `val_predictions.csv` and complete binary metrics. The locked test set is rejected by training code.
 
+### 8b. Prostate or lesion segmentation
+
+Prostate segmentation example:
+
+```powershell
+python -m prostate_iqa.training.train_segmentation_task `
+  --train_json "$ProcessedDir/datalist_train.json" `
+  --val_json "$ProcessedDir/datalist_val.json" `
+  --image_keys dwi `
+  --label_key prostate_mask `
+  --task_name prostate_segmentation `
+  --roi_size 160 160 64 `
+  --out_dir runs/downstream_prostate_seg_v2 `
+  --epochs 100 `
+  --batch_size 2 `
+  --lr 0.0001 `
+  --seed 42
+```
+
+For lesion segmentation, change `--label_key` to `lesion_mask`, change the task
+and output names, and provide cases with lesion masks. The generic 3D MONAI UNet
+uses all voxels in the cropped volume and writes per-case Dice, IoU, ASD, and
+95HD metrics plus `best.pt` and `last.pt`.
+
+The target mask must not appear in `--image_keys`. The code enforces this. A
+prostate mask may be an input to lesion segmentation only when it is genuinely
+available at inference time and is not the lesion target.
+
 ## 9. Generate leakage-safe training quality targets with OOF prediction
 
 ```powershell
@@ -180,6 +229,27 @@ python -m prostate_iqa.training.run_oof_downstream `
 Role: ensures that each training acquisition is scored by a downstream model that did not train on that patient. This avoids turning memorized training success into an artificial quality label.
 
 Outputs: per-fold checkpoints/predictions and `oof_predictions.csv` with one held-out prediction per training row.
+
+For either segmentation task, use the parallel patient-level OOF command:
+
+```powershell
+python -m prostate_iqa.training.run_oof_segmentation `
+  --train_json "$ProcessedDir/datalist_train.json" `
+  --image_keys dwi `
+  --label_key prostate_mask `
+  --task_name prostate_segmentation `
+  --num_folds 5 `
+  --roi_size 160 160 64 `
+  --out_dir runs/oof_prostate_seg_v2 `
+  --epochs 100 `
+  --batch_size 2 `
+  --lr 0.0001 `
+  --seed 42
+```
+
+This writes `oof_segmentation_metrics.csv`. Substitute `lesion_mask` for the
+lesion path. Folds are grouped by patient, so all acquisitions from a patient
+remain together.
 
 ## 10. Convert downstream behavior into quality labels
 
@@ -209,7 +279,25 @@ Role: assigns reject (confident failure), caution (uncertain/mixed result), or a
 
 Thresholds are development choices: tune them with training/validation only, never the locked test set.
 
-For segmentation, provide `--segmentation_metrics_csv` instead. Dice and 95HD then determine accept/caution/reject.
+For segmentation, provide `--segmentation_metrics_csv` instead. Training labels
+must use OOF metrics; validation labels use the independent validation metrics:
+
+```powershell
+python -m prostate_iqa.data.make_task_quality_labels `
+  --manifest_csv "$ProcessedDir/preprocessing_manifest.csv" `
+  --segmentation_metrics_csv runs/oof_prostate_seg_v2/oof_segmentation_metrics.csv `
+  --task_name prostate_segmentation `
+  --split train `
+  --out_csv data/manifests/prostate_seg_quality_train_v2.csv `
+  --dice_accept 0.75 `
+  --dice_reject 0.50 `
+  --hd95_accept 10 `
+  --hd95_reject 20
+```
+
+Dice and 95HD determine accept/caution/reject. The generated manifest records
+`quality_target_key` (`prostate_mask` or `lesion_mask`). IQA trainers reject any
+configuration that puts that target mask in `--image_keys`.
 
 ## 11. Train IQA models
 
@@ -246,6 +334,11 @@ python -m prostate_iqa.training.train_ternary_iqa `
 
 Role: learns to predict whether a scan should be rejected, treated cautiously, or accepted for the selected downstream task. The ternary loss combines cross entropy with ordinal MAE, so reject-to-accept mistakes cost more than adjacent mistakes.
 
+For segmentation-derived IQA, point these same trainers at the segmentation
+quality JSON files and use image-only keys such as `dwi`, `dwi t2`, or
+`dwi t2 prostate_mask` for lesion IQA when the prostate mask is deployable. Do
+not use the segmentation target mask as an IQA input.
+
 ## 12. Evaluate a frozen model
 
 Validation example:
@@ -264,6 +357,19 @@ python -m prostate_iqa.evaluation.eval_model `
 Role: calculates binary or ternary metrics and saves acquisition-level probabilities, confidence, entropy, ordinal expectation, and metadata. Acquisition identity is preserved so distorted and undistorted variants cannot be cross-matched.
 
 Final locked-test evaluation occurs once, after architecture, preprocessing, thresholds, and checkpoint selection are frozen.
+
+Evaluate a frozen segmentation model with:
+
+```powershell
+python -m prostate_iqa.evaluation.eval_segmentation `
+  --ckpt runs/downstream_prostate_seg_v2/best.pt `
+  --datalist_json "$ProcessedDir/datalist_val.json" `
+  --image_keys dwi `
+  --label_key prostate_mask `
+  --task_name prostate_segmentation `
+  --out_csv reports/evaluation/prostate_seg_val_metrics.csv `
+  --out_metrics_json reports/evaluation/prostate_seg_val_summary.json
+```
 
 ## 13. Estimate novelty / out-of-distribution behavior
 
@@ -292,6 +398,11 @@ python -m prostate_iqa.analysis.analyze_quality_vs_task `
 
 Role: this is the central scientific analysis. It asks whether downstream accuracy improves from reject to caution to accept, whether expected quality correlates with downstream success/confidence, and whether novelty predicts failure. Optional segmentation metrics add Dice/IoU/ASD/95HD comparisons.
 
+For a segmentation-only downstream task, omit `--task_predictions_csv` and pass
+`--segmentation_metrics_csv` instead. The analysis then compares Dice, IoU, ASD,
+and 95HD across predicted quality groups and defines downstream success using
+`--segmentation_success_dice` (default 0.75).
+
 Outputs include merged case data, quality-group task summaries, novelty/failure summaries, and simple plots.
 
 ## 15. Generate report figures
@@ -305,6 +416,10 @@ python -m prostate_iqa.analysis.make_report_figures `
 ```
 
 Role: produces publication/report-ready confusion matrices, ROC curves when applicable, class distributions, confidence/entropy/novelty histograms, and task-performance plots using matplotlib only.
+
+For a segmentation-derived IQA report, also pass
+`--segmentation_metrics_csv reports/evaluation/prostate_seg_val_metrics.csv` to
+generate the acquisition-matched quality-group versus Dice boxplot.
 
 ## What uses all slices?
 
@@ -323,3 +438,4 @@ Role: produces publication/report-ready confusion matrices, ROC curves when appl
 5. Freeze the downstream model, IQA model, parameters, and quality thresholds before final test evaluation.
 6. Preserve `patient_id`, `scan_id`, `distortion_status`, and `acquisition_id` in every table and merge.
 7. Treat the task name as part of the quality definition: a scan may be acceptable for one downstream task and unsuitable for another.
+8. For segmentation, center-crop during preprocessing and never feed the target mask to either the segmenter or its derived IQA model.

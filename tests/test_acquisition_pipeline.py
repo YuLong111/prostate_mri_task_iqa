@@ -10,22 +10,86 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import SimpleITK as sitk
+import torch
 
 from prostate_iqa.analysis.analyze_quality_vs_task import (
     _standardize_quality,
     _standardize_task,
 )
+from prostate_iqa.analysis.make_report_figures import _merge_segmentation_metrics
 from prostate_iqa.data.build_manifest import build_manifest
 from prostate_iqa.data.make_task_quality_labels import (
     _classification_records,
     apply_quality_records,
 )
 from prostate_iqa.data.preprocess_cases import main as preprocess_main
+from prostate_iqa.data.segmentation_transforms import get_segmentation_val_transforms
 from prostate_iqa.data.transforms import get_val_transforms
+from prostate_iqa.evaluation.eval_segmentation import _extract_unet_state_dict
 from prostate_iqa.training.train_binary_task import _prepare_items
+from prostate_iqa.training.train_segmentation_task import prepare_segmentation_items
+from prostate_iqa.utils.segmentation import binary_segmentation_metrics
 
 
 class AcquisitionPipelineTests(unittest.TestCase):
+    def test_unet_checkpoint_loader_preserves_monai_model_prefix(self) -> None:
+        weight = torch.ones((2, 1, 3, 3, 3))
+        extracted = _extract_unet_state_dict(
+            {"model_state_dict": {"model.0.conv.weight": weight}}
+        )
+        self.assertEqual(list(extracted), ["model.0.conv.weight"])
+        wrapped = _extract_unet_state_dict(
+            {"model_state_dict": {"module.model.0.conv.weight": weight}}
+        )
+        self.assertEqual(list(wrapped), ["model.0.conv.weight"])
+
+    def test_segmentation_transform_keeps_mask_as_target_not_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = np.arange(8 * 16 * 16, dtype=np.float32).reshape(8, 16, 16)
+            mask = np.zeros_like(image, dtype=np.uint8)
+            mask[2:6, 4:12, 4:12] = 1
+            image_path = root / "dwi.nii.gz"
+            mask_path = root / "prostate_mask.nii.gz"
+            sitk.WriteImage(sitk.GetImageFromArray(image), str(image_path))
+            sitk.WriteImage(sitk.GetImageFromArray(mask), str(mask_path))
+            transform = get_segmentation_val_transforms(
+                ["dwi"], "prostate_mask", (16, 16, 8)
+            )
+            result = transform(
+                {"dwi": str(image_path), "prostate_mask": str(mask_path)}
+            )
+            self.assertEqual(tuple(result["image"].shape), (1, 16, 16, 8))
+            self.assertEqual(tuple(result["label"].shape), (1, 16, 16, 8))
+            self.assertEqual(set(result["label"].unique().tolist()), {0, 1})
+
+    def test_segmentation_metrics_and_target_leakage_guard(self) -> None:
+        mask = np.zeros((8, 8, 8), dtype=np.uint8)
+        mask[2:6, 2:6, 2:6] = 1
+        metrics = binary_segmentation_metrics(mask, mask, (1.0, 1.0, 1.0))
+        self.assertEqual(metrics, {"dice": 1.0, "iou": 1.0, "asd": 0.0, "hd95": 0.0})
+        with self.assertRaisesRegex(ValueError, "Target leakage"):
+            _prepare_items(
+                [
+                    {
+                        "dwi": "dwi.nii.gz",
+                        "prostate_mask": "mask.nii.gz",
+                        "task_quality_bin": 1,
+                        "quality_target_key": "prostate_mask",
+                    }
+                ],
+                ["dwi", "prostate_mask"],
+                "task_quality_bin",
+                "test",
+            )
+        with self.assertRaisesRegex(ValueError, "target leakage"):
+            prepare_segmentation_items(
+                [{"dwi": "dwi.nii.gz", "prostate_mask": "mask.nii.gz"}],
+                ["dwi", "prostate_mask"],
+                "prostate_mask",
+                "test",
+            )
+
     def test_training_items_drop_uncollatable_unused_null_metadata(self) -> None:
         prepared = _prepare_items(
             [
@@ -158,6 +222,27 @@ class AcquisitionPipelineTests(unittest.TestCase):
             validate="one_to_one",
         )
         self.assertEqual(len(merged), 2)
+
+        segmentation = pd.DataFrame(
+            [
+                {
+                    "patient_id": "P1",
+                    "scan_id": "S1",
+                    "acquisition_id": "S1__distorted",
+                    "dice": 0.4,
+                },
+                {
+                    "patient_id": "P1",
+                    "scan_id": "S1",
+                    "acquisition_id": "S1__undistorted",
+                    "dice": 0.9,
+                },
+            ]
+        )
+        report_table = _merge_segmentation_metrics(
+            predictions.assign(pred_quality=[0, 2]), segmentation
+        )
+        self.assertEqual(report_table["seg_dice"].tolist(), [0.4, 0.9])
 
     def test_preprocessing_writes_one_directory_and_json_row_per_acquisition(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

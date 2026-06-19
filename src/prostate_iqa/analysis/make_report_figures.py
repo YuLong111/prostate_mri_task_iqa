@@ -395,6 +395,59 @@ def _dice_boxplot_figure(
     return _save_figure(figure, path)
 
 
+def _merge_segmentation_metrics(
+    quality: pd.DataFrame,
+    segmentation: pd.DataFrame,
+) -> pd.DataFrame:
+    """Attach raw segmentation metrics using acquisition-safe case identity."""
+    left = quality.copy()
+    right = segmentation.copy()
+    existing_dice = _find_column(
+        left, ("seg_dice", "dice", "dice_score", "segmentation_dice")
+    )
+    if existing_dice is not None:
+        left = left.drop(columns=existing_dice)
+    join_keys: list[str] = []
+    for canonical, aliases in (
+        ("patient_id", ("patient_id", "patient")),
+        ("scan_id", ("scan_id", "scan", "study_id")),
+    ):
+        left_column = _find_column(left, aliases)
+        right_column = _find_column(right, aliases)
+        if left_column is None or right_column is None:
+            raise ValueError(
+                f"Both quality and segmentation tables require {canonical}."
+            )
+        key = f"_{canonical}_key"
+        left[key] = left[left_column].astype(str).str.strip().str.casefold()
+        right[key] = right[right_column].astype(str).str.strip().str.casefold()
+        join_keys.append(key)
+
+    left_acquisition = _find_column(left, ("acquisition_id", "acquisition"))
+    right_acquisition = _find_column(right, ("acquisition_id", "acquisition"))
+    if left_acquisition is not None and right_acquisition is not None:
+        key = "_acquisition_id_key"
+        left[key] = left[left_acquisition].astype(str).str.strip().str.casefold()
+        right[key] = right[right_acquisition].astype(str).str.strip().str.casefold()
+        join_keys.append(key)
+
+    if left.duplicated(join_keys).any() or right.duplicated(join_keys).any():
+        raise ValueError(
+            "Quality/segmentation identity is not one-to-one. Preserve acquisition_id "
+            "when a scan has multiple acquisitions."
+        )
+    dice_column = _find_column(
+        right, ("seg_dice", "dice", "dice_score", "segmentation_dice")
+    )
+    if dice_column is None:
+        raise ValueError("Segmentation metrics CSV does not contain a Dice column.")
+    metrics = right[join_keys + [dice_column]].rename(columns={dice_column: "seg_dice"})
+    merged = left.merge(metrics, on=join_keys, how="left", validate="one_to_one")
+    if merged["seg_dice"].notna().sum() == 0:
+        raise ValueError("No quality predictions matched segmentation metrics.")
+    return merged
+
+
 def generate_figures(args: argparse.Namespace) -> list[Path]:
     """Generate every applicable report figure and return saved paths."""
     _set_report_style()
@@ -501,9 +554,16 @@ def generate_figures(args: argparse.Namespace) -> list[Path]:
         else:
             print("Skipping accuracy plot: quality groups or task accuracy unavailable.")
 
+    dice_frame = quality
+    dice_prediction = prediction
+    if args.segmentation_metrics_csv is not None:
+        dice_frame = _merge_segmentation_metrics(
+            quality, read_csv(args.segmentation_metrics_csv)
+        )
+        _, dice_prediction, _ = _quality_labels(dice_frame)
     dice_path = _dice_boxplot_figure(
-        quality,
-        prediction,
+        dice_frame,
+        dice_prediction,
         output_dir / "quality_group_vs_segmentation_dice_boxplot.png",
     )
     if dice_path is not None:
@@ -524,6 +584,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--quality_predictions_csv", type=Path, required=True)
     parser.add_argument("--novelty_csv", type=Path)
     parser.add_argument("--quality_task_summary_csv", type=Path)
+    parser.add_argument(
+        "--segmentation_metrics_csv",
+        type=Path,
+        help="Optional raw Dice table for the quality-group segmentation boxplot.",
+    )
     parser.add_argument(
         "--out_dir",
         type=Path,
