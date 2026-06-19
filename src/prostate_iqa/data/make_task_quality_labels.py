@@ -242,6 +242,7 @@ def _classification_records(
             "task_quality_source": task_name,
             "task_dice": None,
             "task_hd95": None,
+            "quality_target_key": None,
         }
         _store_unique(records, key, record, row_index)
     return records
@@ -267,6 +268,7 @@ def _segmentation_records(
         ("hd95", "95hd", "hausdorff_95", "hausdorff95", "hausdorff_distance_95"),
     )
     assert dice_column is not None
+    label_key_column = _find_column(metrics, ("label_key", "target_key", "mask_key"))
 
     records: dict[CaseKey, dict[str, Any]] = {}
     for row_index, row in metrics.iterrows():
@@ -300,6 +302,11 @@ def _segmentation_records(
             "task_quality_source": task_name,
             "task_dice": dice,
             "task_hd95": hd95,
+            "quality_target_key": (
+                str(row[label_key_column]).strip()
+                if label_key_column is not None and _is_present(row[label_key_column])
+                else None
+            ),
         }
         _store_unique(records, key, record, row_index)
     return records
@@ -366,6 +373,7 @@ def apply_quality_records(
         "task_quality_source": None,
         "task_dice": None,
         "task_hd95": None,
+        "quality_target_key": None,
     }
     for _, row in result.iterrows():
         key = _case_key(row, patient_column, scan_column, acquisition_column)
