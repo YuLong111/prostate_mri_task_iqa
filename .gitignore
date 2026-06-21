@@ -1,9 +1,9 @@
 configs/paths.local.yaml
-data/processed/
+/data/processed/
 runs/
 reports/qc/
 *.pt
 *.pth
 __pycache__/
 reports/
-data/
+/data/

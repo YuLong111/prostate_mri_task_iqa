@@ -58,6 +58,7 @@ REQUIRED_INVENTORY_COLUMNS = {
 
 _LABEL_ALIASES = {
     "patient_id": {
+        "id",
         "patient_id",
         "patientid",
         "patient",
@@ -78,7 +79,7 @@ _LABEL_ALIASES = {
         "volumeid",
     },
     "pirads": {"pirads", "pi_rads", "pi_rads_score", "pirads_score"},
-    "pirads_ge4": {"pirads_ge4", "pi_rads_ge4"},
+    "pirads_ge4": {"pirads_ge4", "pi_rads_ge4", "pirads_4", "pi_rads_4"},
     "gleason_group": {
         "gleason_group",
         "gleason_grade_group",
@@ -223,6 +224,9 @@ def _guess_b_value(scan_id: str) -> int | None:
     match = re.search(r"(?i)(?:^|[_-])b(?:-?value)?[_-]?(\d{3,4})(?:$|[_-])", scan_id)
     if match:
         return int(match.group(1))
+    match = re.search(r"(?i)(?:^|[/\\_-])dwi[_-]?(\d{3,4})(?:$|[/\\_.-])", scan_id)
+    if match:
+        return int(match.group(1))
     return None
 
 
@@ -326,7 +330,11 @@ def build_manifest(inventory: pd.DataFrame) -> pd.DataFrame:
         display_scan_values = [
             _clean_id(value) for value in group["scan_id_guess"] if _is_present(value)
         ]
-        scan_id = display_scan_values[0] if display_scan_values else scan_key
+        scan_id = (
+            display_scan_values[0]
+            if display_scan_values
+            else display_patient[patient_key]
+        )
         study_key = _study_key(scan_id)
         for acquisition_index in range(replicate_count):
             record: dict[str, Any] = {
@@ -362,7 +370,9 @@ def build_manifest(inventory: pd.DataFrame) -> pd.DataFrame:
                 record[modality] = path
             for column in LABEL_COLUMNS:
                 record[column] = pd.NA
-            record["b_value"] = _guess_b_value(scan_id)
+            record["b_value"] = _guess_b_value(
+                f"{scan_id} {record.get('dwi', '')}"
+            )
             records.append(record)
 
     # Preserve mask-only patients for QC while keeping them explicitly separate
@@ -380,7 +390,7 @@ def build_manifest(inventory: pd.DataFrame) -> pd.DataFrame:
         scan_values = [
             _clean_id(value) for value in group["scan_id_guess"] if _is_present(value)
         ]
-        scan_id = scan_values[0] if scan_values else scan_key
+        scan_id = scan_values[0] if scan_values else display_patient[patient_key]
         record = {
             "patient_id": display_patient[patient_key],
             "scan_id": scan_id,
@@ -428,10 +438,30 @@ def standardize_labels(labels: pd.DataFrame) -> pd.DataFrame:
     """Map common label-sheet header variants to manifest column names."""
     keyed_columns = {column: _column_key(column) for column in labels.columns}
     standardized = pd.DataFrame(index=labels.index)
+    # Some cohorts use a column called simply "Gleason" for a precomputed
+    # binary grade-group >= 2 target. Other cohorts use the same header for a
+    # true score or grade group. Infer the meaning only when every populated
+    # value is binary, preserving support for conventional Gleason notation.
+    gleason_sources = [
+        column for column, key in keyed_columns.items() if key == "gleason"
+    ]
+    gleason_is_binary = bool(gleason_sources) and all(
+        all(_parse_binary(value) is not None for value in labels[column].dropna())
+        for column in gleason_sources
+    )
+
     for target, aliases in _LABEL_ALIASES.items():
         sources = [
             column for column, key in keyed_columns.items() if key in aliases
         ]
+        if target == "gleason_group" and gleason_is_binary:
+            sources = [
+                column for column in sources if keyed_columns[column] != "gleason"
+            ]
+        if target == "gleason_ge2" and gleason_is_binary:
+            sources.extend(
+                column for column in gleason_sources if column not in sources
+            )
         standardized[target] = _coalesce_sources(labels, sources)
 
     if standardized["patient_id"].isna().all():
@@ -555,19 +585,31 @@ def merge_labels(manifest: pd.DataFrame, labels: pd.DataFrame) -> pd.DataFrame:
     derived_pirads = result["pirads"].map(
         lambda value: pd.NA if pd.isna(value) else int(value >= 4)
     )
-    result["pirads_ge4"] = derived_pirads.combine_first(direct_pirads).astype("Int64")
+    result["pirads_ge4"] = direct_pirads.combine_first(derived_pirads).astype("Int64")
 
     result["gleason_group"] = result["gleason_group"].map(_parse_gleason_group)
     direct_gleason = result["gleason_ge2"].map(_parse_binary)
     derived_gleason = result["gleason_group"].map(
         lambda value: pd.NA if pd.isna(value) else int(value >= 2)
     )
-    result["gleason_ge2"] = derived_gleason.combine_first(direct_gleason).astype("Int64")
+    result["gleason_ge2"] = direct_gleason.combine_first(derived_gleason).astype("Int64")
     result["dwi_quality_bin"] = result["dwi_quality_bin"].map(_parse_binary).astype("Int64")
 
     numeric_columns = ("pirads", "gleason_group", "field_strength", "b_value")
     for column in numeric_columns:
         result[column] = pd.to_numeric(result[column], errors="coerce")
+    return result
+
+
+def apply_manifest_defaults(
+    manifest: pd.DataFrame,
+    site: str | None = None,
+) -> pd.DataFrame:
+    """Fill cohort metadata supplied outside an inventory or label sheet."""
+    result = manifest.copy()
+    if site is not None and site.strip():
+        missing = ~result["site"].map(_is_present)
+        result.loc[missing, "site"] = site.strip()
     return result
 
 
@@ -653,6 +695,14 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_OUT_CSV,
         help="Master manifest output (default: data/manifests/master_manifest.csv).",
     )
+    parser.add_argument(
+        "--site",
+        default=None,
+        help=(
+            "Optional cohort/site name used when labels do not provide one "
+            "(for example Miami or PROMIS)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -664,10 +714,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.labels_csv is not None:
         labels = _read_label_sheet(args.labels_csv)
         manifest = merge_labels(manifest, labels)
+    manifest = apply_manifest_defaults(manifest, args.site)
 
     out_csv = write_csv(manifest, args.out_csv)
-    missingness_csv = out_csv.parent / "manifest_missingness.csv"
-    modality_csv = out_csv.parent / "modality_summary.csv"
+    if out_csv.name == DEFAULT_OUT_CSV.name:
+        missingness_csv = out_csv.parent / "manifest_missingness.csv"
+        modality_csv = out_csv.parent / "modality_summary.csv"
+    else:
+        missingness_csv = out_csv.with_name(f"{out_csv.stem}_missingness.csv")
+        modality_csv = out_csv.with_name(f"{out_csv.stem}_modality_summary.csv")
     write_csv(build_missingness_summary(manifest), missingness_csv)
     write_csv(build_modality_summary(manifest), modality_csv)
 

@@ -17,7 +17,12 @@ from prostate_iqa.analysis.analyze_quality_vs_task import (
     _standardize_task,
 )
 from prostate_iqa.analysis.make_report_figures import _merge_segmentation_metrics
-from prostate_iqa.data.build_manifest import build_manifest
+from prostate_iqa.data.build_inventory import guess_modality, guess_patient_id
+from prostate_iqa.data.build_manifest import (
+    apply_manifest_defaults,
+    build_manifest,
+    merge_labels,
+)
 from prostate_iqa.data.make_task_quality_labels import (
     _classification_records,
     apply_quality_records,
@@ -62,6 +67,86 @@ class AcquisitionPipelineTests(unittest.TestCase):
             self.assertEqual(tuple(result["image"].shape), (1, 16, 16, 8))
             self.assertEqual(tuple(result["label"].shape), (1, 16, 16, 8))
             self.assertEqual(set(result["label"].unique().tolist()), {0, 1})
+
+    def test_lesion_segmentation_preserves_prostate_mask_input(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            image = np.arange(8 * 16 * 16, dtype=np.float32).reshape(8, 16, 16)
+            prostate = np.zeros_like(image, dtype=np.uint8)
+            prostate[1:7, 3:13, 3:13] = 1
+            lesion = np.zeros_like(image, dtype=np.uint8)
+            lesion[3:5, 7:9, 7:9] = 4
+            paths = {}
+            for name, array in (
+                ("dwi", image),
+                ("prostate_mask", prostate),
+                ("lesion_mask", lesion),
+            ):
+                path = root / f"{name}.nii.gz"
+                sitk.WriteImage(sitk.GetImageFromArray(array), str(path))
+                paths[name] = str(path)
+
+            transform = get_segmentation_val_transforms(
+                ["dwi", "prostate_mask"], "lesion_mask", (16, 16, 8)
+            )
+            result = transform(paths)
+
+            self.assertEqual(tuple(result["image"].shape), (2, 16, 16, 8))
+            self.assertGreater(int(result["image"][1].sum()), 0)
+            self.assertEqual(set(result["image"][1].unique().tolist()), {0.0, 1.0})
+            self.assertEqual(set(result["label"].unique().tolist()), {0, 1})
+
+    def test_miami_promis_identifiers_and_binary_labels(self) -> None:
+        self.assertEqual(
+            guess_patient_id(Path("data-ROI-192-96/P-1000/dwi_2000.nii.gz")),
+            "P-1000",
+        )
+        self.assertEqual(guess_modality(Path("P-1000/dwi_2000.nii.gz")), "dwi")
+        self.assertEqual(
+            guess_modality(Path("P-1000/lesion_mask.nii.gz")), "lesion_mask"
+        )
+        self.assertEqual(
+            guess_modality(Path("P-1000/gland_zone_set1_cg.nii.gz")),
+            "gland_zone_mask",
+        )
+
+        inventory = pd.DataFrame(
+            [
+                {
+                    "file_path": f"C:/Miami/P-1000/{name}.nii.gz",
+                    "patient_id_guess": "P-1000",
+                    "scan_id_guess": "",
+                    "modality_guess": modality,
+                    "distortion_status": "unknown",
+                }
+                for name, modality in (
+                    ("t2", "t2"),
+                    ("dwi_2000", "dwi"),
+                    ("adc", "adc"),
+                    ("prostate_mask", "prostate_mask"),
+                    ("lesion_mask", "lesion_mask"),
+                )
+            ]
+        )
+        manifest = build_manifest(inventory)
+        self.assertEqual(len(manifest), 1)
+        self.assertEqual(manifest.loc[0, "scan_id"], "P-1000")
+        self.assertEqual(manifest.loc[0, "b_value"], 2000)
+
+        labels = pd.DataFrame(
+            {
+                "id": ["P-1000"],
+                "PIRADS_score": [33],
+                "PIRADS_4": [1],
+                "Gleason": [1],
+            }
+        )
+        labeled = apply_manifest_defaults(merge_labels(manifest, labels), "Miami")
+        self.assertTrue(pd.isna(labeled.loc[0, "pirads"]))
+        self.assertEqual(labeled.loc[0, "pirads_ge4"], 1)
+        self.assertTrue(pd.isna(labeled.loc[0, "gleason_group"]))
+        self.assertEqual(labeled.loc[0, "gleason_ge2"], 1)
+        self.assertEqual(labeled.loc[0, "site"], "Miami")
 
     def test_segmentation_metrics_and_target_leakage_guard(self) -> None:
         mask = np.zeros((8, 8, 8), dtype=np.uint8)

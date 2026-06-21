@@ -43,6 +43,70 @@ Output: `data/manifests/file_inventory.csv`.
 
 Check the modality and suffix counts printed by the command. Incorrect guesses should be corrected in the inventory or naming logic before proceeding.
 
+### Miami and PROMIS cohort setup
+
+The importer recognizes their `P-<number>` directories and exact filenames
+(`t2`, `dwi_2000`/`dwi`, `adc`, `prostate_mask`, and `lesion_mask`). Their
+workbooks use `id`, `PIRADS_score`, `PIRADS_4`, and a binary `Gleason` target;
+these are mapped to `patient_id`, `pirads`, `pirads_ge4`, and `gleason_ge2`.
+Invalid raw PI-RADS values remain missing while the explicit `PIRADS_4` target
+is retained.
+
+Build separate, site-labelled manifests so their summaries and locked splits
+cannot overwrite one another:
+
+```powershell
+$Summer = "C:\Users\asus\OneDrive - University College London\summer"
+
+foreach ($Cohort in "Miami", "PROMIS") {
+  $Name = $Cohort.ToLower()
+  python -m prostate_iqa.data.build_inventory `
+    --dataset_root "$Summer\$Cohort" `
+    --out_csv "data/manifests/${Name}_inventory.csv"
+
+  python -m prostate_iqa.data.build_manifest `
+    --inventory_csv "data/manifests/${Name}_inventory.csv" `
+    --labels_csv "$Summer\$Cohort\${Name}_scores.xlsx" `
+    --site $Cohort `
+    --out_csv "data/manifests/${Name}_master_manifest.csv"
+
+  python -m prostate_iqa.data.split_patient_level `
+    --manifest_csv "data/manifests/${Name}_master_manifest.csv" `
+    --out_dir "data/splits/$Name" `
+    --stratify_key pirads_ge4 `
+    --seed 42
+}
+```
+
+For both cohorts, the ADC-independent clinical inputs are
+`--image_keys dwi t2 prostate_mask`. Prostate segmentation must instead use
+`--image_keys dwi t2 --label_key prostate_mask`; lesion segmentation may use
+`--image_keys dwi t2 prostate_mask --label_key lesion_mask`. A missing lesion
+mask is treated as an unavailable annotation, never as a negative mask.
+
+Before a long training run, exercise every network on one real **training**
+case and the CUDA device:
+
+```powershell
+python -m prostate_iqa.training.smoke_test_downstream `
+  --datalist_json data/splits/miami/datalist_train.json `
+  --device cuda `
+  --check_backward `
+  --out_json reports/testing/miami_downstream_smoke.json
+
+python -m prostate_iqa.training.smoke_test_downstream `
+  --datalist_json data/splits/promis/datalist_train.json `
+  --device cuda `
+  --out_json reports/testing/promis_downstream_smoke.json
+```
+
+The smoke ROI is deliberately small (`64 x 64 x 32`) and tests loading,
+channel order, binary/ternary DenseNet heads, and U-Net tensor compatibility;
+it is not a scientifically valid training ROI. Choose the production ROI from
+training/validation QC and then freeze it before locked-test evaluation. Add
+`--roi_size 160 160 64 --check_backward` to verify one full optimizer step fits
+in GPU memory before launching a long run.
+
 ## 3. Build the acquisition-level master manifest
 
 For a new corrected experiment, use versioned outputs rather than replacing an experimental locked split:

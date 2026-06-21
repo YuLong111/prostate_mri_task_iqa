@@ -49,6 +49,10 @@ INVENTORY_COLUMNS = (
 # Requiring a recognisable prefix avoids treating dates, series numbers, and
 # image dimensions as patient identifiers.
 _PATIENT_PATTERNS = (
+    # Miami and PROMIS use directory names such as P-1000 and P-10104751.
+    # Keep the required hyphen so ordinary tokens beginning with "P" are not
+    # mistaken for patient identifiers.
+    re.compile(r"(?i)(?<![a-z0-9])(p-\d+)(?![a-z0-9])"),
     re.compile(r"(?i)(?<![a-z0-9])(patient\d+)(?![a-z0-9])"),
     re.compile(
         r"(?i)(?<![a-z0-9])"
@@ -141,6 +145,8 @@ def guess_modality(relative_path: Path) -> str:
 
     # The dataset's directory names are stronger evidence than filenames: T2
     # and DWI files deliberately share the same volume reference filenames.
+    if any("gland_zone" in part for part in path_parts):
+        return "gland_zone_mask"
     if any("prostate_mask" in part for part in path_parts):
         return "prostate_mask"
     if "dwi" in path_parts:
@@ -172,7 +178,7 @@ def guess_modality(relative_path: Path) -> str:
 
 def guess_distortion_status(relative_path: Path, modality: str) -> str:
     """Read the image distortion group from the dataset folder name."""
-    if modality == "prostate_mask":
+    if modality.endswith("_mask") or modality == "mask":
         return "not_applicable"
 
     text = relative_path.as_posix().lower()
