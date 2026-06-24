@@ -218,6 +218,39 @@ def _weighted_sampler(
     )
 
 
+def _class_weight_tensor(
+    items: Sequence[dict[str, Any]],
+    device: torch.device,
+) -> torch.Tensor:
+    """Return inverse-frequency class weights normalized around one."""
+    counts = _class_counts(items)
+    total = float(sum(counts.values()))
+    weights = [
+        total / (2.0 * max(float(counts[label]), 1.0))
+        for label in (0, 1)
+    ]
+    return torch.as_tensor(weights, dtype=torch.float32, device=device)
+
+
+def _make_binary_criterion(
+    items: Sequence[dict[str, Any]],
+    device: torch.device,
+    args: argparse.Namespace,
+) -> torch.nn.CrossEntropyLoss:
+    """Create a binary classification loss with optional label smoothing/weights."""
+    imbalance_strategy = getattr(args, "imbalance_strategy", "sampler")
+    class_weights = (
+        _class_weight_tensor(items, device)
+        if imbalance_strategy == "class_weight"
+        else None
+    )
+    label_smoothing = float(getattr(args, "label_smoothing", 0.0))
+    return torch.nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=label_smoothing,
+    )
+
+
 def _batch_strings(batch: dict[str, Any], key: str, count: int) -> list[str]:
     """Extract string identifiers from a collated MONAI batch."""
     values = batch.get(key)
@@ -330,6 +363,11 @@ def _checkpoint(
         "target_key": args.target_key,
         "roi_size": list(args.roi_size),
         "seed": args.seed,
+        "dropout_prob": float(getattr(args, "dropout_prob", 0.0)),
+        "weight_decay": float(getattr(args, "weight_decay", 0.0)),
+        "label_smoothing": float(getattr(args, "label_smoothing", 0.0)),
+        "imbalance_strategy": getattr(args, "imbalance_strategy", "sampler"),
+        "scheduler": "cosine_annealing_lr",
     }
 
 
@@ -370,9 +408,18 @@ def train(args: argparse.Namespace) -> dict[str, float]:
     train_dataset = Dataset(train_items, transform=train_transforms)
     val_dataset = Dataset(val_items, transform=val_transforms)
 
-    sampler = _weighted_sampler(train_items, args.seed)
+    imbalance_strategy = getattr(args, "imbalance_strategy", "sampler")
+    sampler = (
+        _weighted_sampler(train_items, args.seed)
+        if imbalance_strategy == "sampler"
+        else None
+    )
     if sampler is not None:
         print("Using inverse-frequency WeightedRandomSampler for class imbalance.")
+    elif imbalance_strategy == "class_weight":
+        print("Using inverse-frequency class weights for class imbalance.")
+    elif imbalance_strategy == "none":
+        print("Using unweighted random sampling/loss.")
     drop_singleton = args.batch_size > 1 and len(train_items) % args.batch_size == 1
     if drop_singleton:
         print("Dropping the final singleton training batch for BatchNorm stability.")
@@ -397,9 +444,21 @@ def train(args: argparse.Namespace) -> dict[str, float]:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
-    model = build_densenet121(len(args.image_keys), 2).to(device)
-    criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    model = build_densenet121(
+        len(args.image_keys),
+        2,
+        dropout_prob=float(getattr(args, "dropout_prob", 0.0)),
+    ).to(device)
+    criterion = _make_binary_criterion(train_items, device, args)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=float(getattr(args, "weight_decay", 0.0)),
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+    )
 
     best_auc = -math.inf
     best_metrics: dict[str, float] = {}
@@ -424,6 +483,7 @@ def train(args: argparse.Namespace) -> dict[str, float]:
         val_metrics, val_predictions = evaluate(model, val_loader, device)
         _print_metrics(epoch, train_loss, val_metrics)
         history.append({"epoch": epoch, "train_loss": train_loss, **val_metrics})
+        scheduler.step()
 
         if val_metrics["auc"] > best_auc:
             best_auc = val_metrics["auc"]
@@ -463,6 +523,27 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number")
+    return parsed
+
+
+def _dropout_probability(value: str) -> float:
+    parsed = _nonnegative_float(value)
+    if parsed >= 1:
+        raise argparse.ArgumentTypeError("must be less than 1")
+    return parsed
+
+
+def _label_smoothing_value(value: str) -> float:
+    parsed = _nonnegative_float(value)
+    if parsed >= 1:
+        raise argparse.ArgumentTypeError("must be less than 1")
+    return parsed
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -483,6 +564,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--epochs", type=_positive_int, default=50)
     parser.add_argument("--batch_size", type=_positive_int, default=1)
     parser.add_argument("--lr", type=_positive_float, default=1e-4)
+    parser.add_argument(
+        "--weight_decay",
+        type=_nonnegative_float,
+        default=0.0,
+        help="AdamW weight decay. Try 1e-4 when validation AUC overfits.",
+    )
+    parser.add_argument(
+        "--label_smoothing",
+        type=_label_smoothing_value,
+        default=0.0,
+        help="Cross-entropy label smoothing in [0, 1). Try 0.03-0.05.",
+    )
+    parser.add_argument(
+        "--dropout_prob",
+        type=_dropout_probability,
+        default=0.0,
+        help="DenseNet dropout probability. Try 0.1 for weak generalization.",
+    )
+    parser.add_argument(
+        "--imbalance_strategy",
+        choices=("sampler", "class_weight", "none"),
+        default="sampler",
+        help=(
+            "How to handle binary class imbalance. 'class_weight' often gives "
+            "better calibration than oversampling when imbalance is mild."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=0)
     return parser.parse_args(argv)

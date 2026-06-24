@@ -24,6 +24,7 @@ from prostate_iqa.training.train_binary_task import (
     _batch_strings,
     _class_counts,
     _load_datalist,
+    _make_binary_criterion,
     _prepare_items,
     _weighted_sampler,
 )
@@ -186,9 +187,18 @@ def _make_loaders(
     train_transform = get_train_transforms(args.image_keys, args.roi_size)
     train_transform.set_random_state(seed=fold_seed)
     holdout_transform = get_val_transforms(args.image_keys, args.roi_size)
-    sampler = _weighted_sampler(train_items, fold_seed)
+    imbalance_strategy = getattr(args, "imbalance_strategy", "sampler")
+    sampler = (
+        _weighted_sampler(train_items, fold_seed)
+        if imbalance_strategy == "sampler"
+        else None
+    )
     if sampler is not None:
         print("  Using inverse-frequency WeightedRandomSampler.")
+    elif imbalance_strategy == "class_weight":
+        print("  Using inverse-frequency class weights.")
+    elif imbalance_strategy == "none":
+        print("  Using unweighted random sampling/loss.")
     drop_singleton = args.batch_size > 1 and len(train_items) % args.batch_size == 1
     if drop_singleton:
         print("  Dropping the final singleton training batch for BatchNorm stability.")
@@ -232,6 +242,11 @@ def _fold_checkpoint(
         "target_key": args.target_key,
         "roi_size": list(args.roi_size),
         "seed": args.seed + fold,
+        "dropout_prob": float(getattr(args, "dropout_prob", 0.0)),
+        "weight_decay": float(getattr(args, "weight_decay", 0.0)),
+        "label_smoothing": float(getattr(args, "label_smoothing", 0.0)),
+        "imbalance_strategy": getattr(args, "imbalance_strategy", "sampler"),
+        "scheduler": "cosine_annealing_lr",
         "train_patient_ids": list(train_patients),
         "holdout_patient_ids": list(holdout_patients),
         "selection_basis": "fixed_epoch_budget_without_holdout_tuning",
@@ -244,10 +259,19 @@ def _train_fold(
     device: torch.device,
     args: argparse.Namespace,
     fold: int,
+    train_items: Sequence[dict[str, Any]],
 ) -> tuple[torch.optim.Optimizer, float, list[dict[str, Any]]]:
     """Train one fold without observing holdout labels or predictions."""
-    criterion = torch.nn.CrossEntropyLoss()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    criterion = _make_binary_criterion(train_items, device, args)
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=float(getattr(args, "weight_decay", 0.0)),
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.epochs,
+    )
     history: list[dict[str, Any]] = []
     final_loss = float("nan")
     for epoch in range(1, args.epochs + 1):
@@ -271,6 +295,7 @@ def _train_fold(
             f"  Fold {fold} | epoch {epoch:03d}/{args.epochs:03d} "
             f"| train_loss={final_loss:.4f}"
         )
+        scheduler.step()
     return optimizer, final_loss, history
 
 
@@ -405,9 +430,13 @@ def run_oof(args: argparse.Namespace) -> dict[str, Any]:
         train_loader, holdout_loader = _make_loaders(
             fold_train, fold_holdout, args, fold_seed
         )
-        model = build_densenet121(len(args.image_keys), out_channels=2).to(device)
+        model = build_densenet121(
+            len(args.image_keys),
+            out_channels=2,
+            dropout_prob=float(getattr(args, "dropout_prob", 0.0)),
+        ).to(device)
         optimizer, train_loss, history = _train_fold(
-            model, train_loader, device, args, fold
+            model, train_loader, device, args, fold, fold_train
         )
         all_history.extend(history)
         checkpoint_path = output_dir / f"fold_{fold}_best.pt"
@@ -494,6 +523,22 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _nonnegative_float(value: str) -> float:
+    """Parse a finite non-negative floating-point CLI value."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number")
+    return parsed
+
+
+def _less_than_one_float(value: str) -> float:
+    """Parse a finite value in the half-open interval [0, 1)."""
+    parsed = _nonnegative_float(value)
+    if parsed >= 1:
+        raise argparse.ArgumentTypeError("must be less than 1")
+    return parsed
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse OOF training command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -517,6 +562,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--epochs", type=_positive_int, default=50)
     parser.add_argument("--batch_size", type=_positive_int, default=1)
     parser.add_argument("--lr", type=_positive_float, default=1e-4)
+    parser.add_argument(
+        "--weight_decay",
+        type=_nonnegative_float,
+        default=0.0,
+        help="AdamW weight decay. Try 1e-4 when fold losses overfit.",
+    )
+    parser.add_argument(
+        "--label_smoothing",
+        type=_less_than_one_float,
+        default=0.0,
+        help="Cross-entropy label smoothing in [0, 1). Try 0.03-0.05.",
+    )
+    parser.add_argument(
+        "--dropout_prob",
+        type=_less_than_one_float,
+        default=0.0,
+        help="DenseNet dropout probability. Try 0.1 for weak generalization.",
+    )
+    parser.add_argument(
+        "--imbalance_strategy",
+        choices=("sampler", "class_weight", "none"),
+        default="sampler",
+        help=(
+            "How to handle binary class imbalance. 'class_weight' often gives "
+            "better calibration than oversampling when imbalance is mild."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=0)
     return parser.parse_args(argv)

@@ -222,6 +222,7 @@ def build_densenet121(
     in_channels: int,
     out_channels: int,
     pretrained_ckpt: CheckpointType | None = None,
+    dropout_prob: float = 0.0,
 ) -> DenseNet121:
     """Build a 3D MONAI DenseNet121 and optionally load compatible weights.
 
@@ -232,11 +233,14 @@ def build_densenet121(
         raise ValueError("in_channels must be a positive integer.")
     if out_channels <= 0:
         raise ValueError("out_channels must be a positive integer.")
+    if dropout_prob < 0 or dropout_prob >= 1:
+        raise ValueError("dropout_prob must be in the half-open interval [0, 1).")
 
     model = DenseNet121(
         spatial_dims=3,
         in_channels=int(in_channels),
         out_channels=int(out_channels),
+        dropout_prob=float(dropout_prob),
     )
     if pretrained_ckpt is not None:
         _load_compatible_weights(model, pretrained_ckpt, int(in_channels))

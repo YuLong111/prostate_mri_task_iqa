@@ -11,6 +11,7 @@ from monai.config import KeysCollection
 from monai.transforms import (
     Compose,
     ConcatItemsd,
+    CropForegroundd,
     DeleteItemsd,
     EnsureChannelFirstd,
     EnsureTyped,
@@ -141,6 +142,15 @@ def _base_transforms(
     ]
     if intensity_keys:
         transforms.append(RobustNonzeroPercentileScaled(keys=intensity_keys))
+    if "prostate_mask" in image_keys:
+        transforms.append(
+            CropForegroundd(
+                keys=image_keys,
+                source_key="prostate_mask",
+                margin=(16, 16, 8),
+                allow_smaller=True,
+            )
+        )
     transforms.append(
         ResizeWithPadOrCropd(
             keys=image_keys,

@@ -30,6 +30,22 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+def _nonnegative_float(value: str) -> float:
+    """Parse a finite non-negative floating-point command-line value."""
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be a finite non-negative number")
+    return parsed
+
+
+def _less_than_one_float(value: str) -> float:
+    """Parse a finite value in the half-open interval [0, 1)."""
+    parsed = _nonnegative_float(value)
+    if parsed >= 1:
+        raise argparse.ArgumentTypeError("must be less than 1")
+    return parsed
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse binary IQA training arguments."""
     parser = argparse.ArgumentParser(
@@ -61,6 +77,33 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--epochs", type=_positive_int, default=50)
     parser.add_argument("--batch_size", type=_positive_int, default=1)
     parser.add_argument("--lr", type=_positive_float, default=1e-4)
+    parser.add_argument(
+        "--weight_decay",
+        type=_nonnegative_float,
+        default=0.0,
+        help="AdamW weight decay. Try 1e-4 when validation AUC overfits.",
+    )
+    parser.add_argument(
+        "--label_smoothing",
+        type=_less_than_one_float,
+        default=0.0,
+        help="Cross-entropy label smoothing in [0, 1). Try 0.03-0.05.",
+    )
+    parser.add_argument(
+        "--dropout_prob",
+        type=_less_than_one_float,
+        default=0.0,
+        help="DenseNet dropout probability. Try 0.1 for weak generalization.",
+    )
+    parser.add_argument(
+        "--imbalance_strategy",
+        choices=("sampler", "class_weight", "none"),
+        default="sampler",
+        help=(
+            "How to handle binary class imbalance. 'class_weight' often gives "
+            "better calibration than oversampling when imbalance is mild."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=0)
     return parser.parse_args(argv)
