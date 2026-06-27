@@ -51,6 +51,18 @@ def _validate_inputs(
     return keys, size
 
 
+def _validate_margin(
+    margin: Sequence[int] | None,
+) -> tuple[int, int, int]:
+    """Validate foreground-crop margins."""
+    if margin is None:
+        return (16, 16, 8)
+    parsed = tuple(int(value) for value in margin)
+    if len(parsed) != 3 or any(value < 0 for value in parsed):
+        raise ValueError("crop_margin must contain three non-negative integers.")
+    return parsed
+
+
 def _scale_tensor_channel(channel: torch.Tensor) -> torch.Tensor:
     """Robustly scale one tensor channel using finite nonzero p1/p99."""
     finite = torch.isfinite(channel)
@@ -132,6 +144,8 @@ class RobustNonzeroPercentileScaled(MapTransform):
 def _base_transforms(
     image_keys: tuple[str, ...],
     roi_size: tuple[int, int, int],
+    crop_margin: tuple[int, int, int],
+    mask_crop: bool,
 ) -> list[Any]:
     """Create deterministic loading, normalization, and sizing transforms."""
     intensity_keys = tuple(key for key in image_keys if not _is_mask_key(key))
@@ -142,12 +156,12 @@ def _base_transforms(
     ]
     if intensity_keys:
         transforms.append(RobustNonzeroPercentileScaled(keys=intensity_keys))
-    if "prostate_mask" in image_keys:
+    if mask_crop and "prostate_mask" in image_keys:
         transforms.append(
             CropForegroundd(
                 keys=image_keys,
                 source_key="prostate_mask",
-                margin=(16, 16, 8),
+                margin=crop_margin,
                 allow_smaller=True,
             )
         )
@@ -173,15 +187,18 @@ def _final_transforms(image_keys: tuple[str, ...]) -> list[Any]:
 def get_train_transforms(
     image_keys: Sequence[str],
     roi_size: Sequence[int],
+    crop_margin: Sequence[int] | None = None,
+    mask_crop: bool = True,
 ) -> Compose:
     """Return loading, preprocessing, and light training augmentation transforms."""
     keys, size = _validate_inputs(image_keys, roi_size)
+    margin = _validate_margin(crop_margin)
     intensity_keys = tuple(key for key in keys if not _is_mask_key(key))
     interpolation_modes = tuple(
         "nearest" if _is_mask_key(key) else "bilinear" for key in keys
     )
 
-    transforms = _base_transforms(keys, size)
+    transforms = _base_transforms(keys, size, margin, mask_crop)
     transforms.extend(
         [
             RandFlipd(keys=keys, prob=0.2, spatial_axis=0),
@@ -227,9 +244,12 @@ def get_train_transforms(
 def get_val_transforms(
     image_keys: Sequence[str],
     roi_size: Sequence[int],
+    crop_margin: Sequence[int] | None = None,
+    mask_crop: bool = True,
 ) -> Compose:
     """Return deterministic validation and locked-test transforms."""
     keys, size = _validate_inputs(image_keys, roi_size)
-    transforms = _base_transforms(keys, size)
+    margin = _validate_margin(crop_margin)
+    transforms = _base_transforms(keys, size, margin, mask_crop)
     transforms.extend(_final_transforms(keys))
     return Compose(transforms)

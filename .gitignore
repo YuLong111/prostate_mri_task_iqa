@@ -7,3 +7,5 @@ reports/qc/
 __pycache__/
 reports/
 /data/
+/reports/
+/tmp/

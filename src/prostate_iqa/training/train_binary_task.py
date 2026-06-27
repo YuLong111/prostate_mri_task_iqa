@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from monai.data import DataLoader, Dataset
 from monai.utils import set_determinism
 from sklearn.metrics import (
@@ -232,11 +233,49 @@ def _class_weight_tensor(
     return torch.as_tensor(weights, dtype=torch.float32, device=device)
 
 
+class FocalCrossEntropyLoss(torch.nn.Module):
+    """Cross-entropy focal loss for hard-example emphasis."""
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        weight: torch.Tensor | None = None,
+        label_smoothing: float = 0.0,
+    ) -> None:
+        super().__init__()
+        if gamma < 0:
+            raise ValueError("focal gamma must be non-negative.")
+        if label_smoothing < 0 or label_smoothing >= 1:
+            raise ValueError("label_smoothing must be in [0, 1).")
+        self.gamma = float(gamma)
+        self.label_smoothing = float(label_smoothing)
+        if weight is not None:
+            self.register_buffer("weight", weight.detach().clone().float())
+        else:
+            self.weight = None
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """Calculate mean focal cross-entropy."""
+        ce_loss = F.cross_entropy(
+            logits,
+            target,
+            weight=self.weight,
+            reduction="none",
+            label_smoothing=self.label_smoothing,
+        )
+        true_class_probability = torch.softmax(logits, dim=1).gather(
+            1,
+            target.unsqueeze(1),
+        ).squeeze(1)
+        focal_factor = (1.0 - true_class_probability).clamp_min(0.0).pow(self.gamma)
+        return (focal_factor * ce_loss).mean()
+
+
 def _make_binary_criterion(
     items: Sequence[dict[str, Any]],
     device: torch.device,
     args: argparse.Namespace,
-) -> torch.nn.CrossEntropyLoss:
+) -> torch.nn.Module:
     """Create a binary classification loss with optional label smoothing/weights."""
     imbalance_strategy = getattr(args, "imbalance_strategy", "sampler")
     class_weights = (
@@ -245,6 +284,13 @@ def _make_binary_criterion(
         else None
     )
     label_smoothing = float(getattr(args, "label_smoothing", 0.0))
+    loss_name = str(getattr(args, "loss", "ce")).strip().lower()
+    if loss_name == "focal":
+        return FocalCrossEntropyLoss(
+            gamma=float(getattr(args, "focal_gamma", 2.0)),
+            weight=class_weights,
+            label_smoothing=label_smoothing,
+        )
     return torch.nn.CrossEntropyLoss(
         weight=class_weights,
         label_smoothing=label_smoothing,
@@ -261,6 +307,60 @@ def _batch_strings(batch: dict[str, Any], key: str, count: int) -> list[str]:
     if isinstance(values, torch.Tensor):
         return [str(value) for value in values.detach().cpu().tolist()]
     return [str(values)] * count
+
+
+def _transform_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    """Return optional transform tuning settings."""
+    return {
+        "crop_margin": tuple(getattr(args, "crop_margin", (16, 16, 8))),
+        "mask_crop": bool(getattr(args, "mask_crop", True)),
+    }
+
+
+def _build_binary_model(args: argparse.Namespace) -> torch.nn.Module:
+    """Build the configured binary DenseNet classifier."""
+    return build_densenet121(
+        len(args.image_keys),
+        2,
+        dropout_prob=float(getattr(args, "dropout_prob", 0.0)),
+    )
+
+
+def _make_ema_model(
+    model: torch.nn.Module,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> torch.nn.Module | None:
+    """Create an EMA copy of the model when requested."""
+    ema_decay = float(getattr(args, "ema_decay", 0.0))
+    if ema_decay <= 0:
+        return None
+    if ema_decay >= 1:
+        raise ValueError("ema_decay must be in [0, 1).")
+    ema_model = _build_binary_model(args).to(device)
+    ema_model.load_state_dict(model.state_dict())
+    ema_model.eval()
+    for parameter in ema_model.parameters():
+        parameter.requires_grad_(False)
+    return ema_model
+
+
+@torch.no_grad()
+def _update_ema_model(
+    model: torch.nn.Module,
+    ema_model: torch.nn.Module | None,
+    ema_decay: float,
+) -> None:
+    """Update an exponential moving average model in-place."""
+    if ema_model is None:
+        return
+    model_state = model.state_dict()
+    ema_state = ema_model.state_dict()
+    for key, value in model_state.items():
+        if torch.is_floating_point(value):
+            ema_state[key].mul_(ema_decay).add_(value.detach(), alpha=1.0 - ema_decay)
+        else:
+            ema_state[key].copy_(value)
 
 
 def calculate_binary_metrics(
@@ -298,8 +398,11 @@ def evaluate(
     model: torch.nn.Module,
     loader: DataLoader,
     device: torch.device,
+    positive_threshold: float = 0.5,
 ) -> tuple[dict[str, float], pd.DataFrame]:
     """Evaluate a model and return metrics plus per-scan predictions."""
+    if not 0.0 <= positive_threshold <= 1.0:
+        raise ValueError("positive_threshold must be in [0, 1].")
     model.eval()
     rows: list[dict[str, Any]] = []
     for batch in loader:
@@ -307,7 +410,7 @@ def evaluate(
         labels = torch.as_tensor(batch["label"], dtype=torch.long, device=device)
         logits = model(images)
         probabilities = torch.softmax(logits, dim=1)
-        predictions = probabilities.argmax(dim=1)
+        predictions = (probabilities[:, 1] >= positive_threshold).long()
 
         labels_cpu = labels.detach().cpu().numpy()
         probabilities_cpu = probabilities.detach().cpu().numpy()
@@ -367,6 +470,13 @@ def _checkpoint(
         "weight_decay": float(getattr(args, "weight_decay", 0.0)),
         "label_smoothing": float(getattr(args, "label_smoothing", 0.0)),
         "imbalance_strategy": getattr(args, "imbalance_strategy", "sampler"),
+        "loss": getattr(args, "loss", "ce"),
+        "focal_gamma": float(getattr(args, "focal_gamma", 2.0)),
+        "ema_decay": float(getattr(args, "ema_decay", 0.0)),
+        "grad_clip": float(getattr(args, "grad_clip", 0.0)),
+        "positive_threshold": float(getattr(args, "positive_threshold", 0.5)),
+        "crop_margin": list(getattr(args, "crop_margin", (16, 16, 8))),
+        "mask_crop": bool(getattr(args, "mask_crop", True)),
         "scheduler": "cosine_annealing_lr",
     }
 
@@ -402,9 +512,18 @@ def train(args: argparse.Namespace) -> dict[str, float]:
     print(f"Training class counts: {train_counts}")
     print(f"Validation class counts: {val_counts}")
 
-    train_transforms = get_train_transforms(args.image_keys, args.roi_size)
+    transform_kwargs = _transform_kwargs(args)
+    train_transforms = get_train_transforms(
+        args.image_keys,
+        args.roi_size,
+        **transform_kwargs,
+    )
     train_transforms.set_random_state(seed=args.seed)
-    val_transforms = get_val_transforms(args.image_keys, args.roi_size)
+    val_transforms = get_val_transforms(
+        args.image_keys,
+        args.roi_size,
+        **transform_kwargs,
+    )
     train_dataset = Dataset(train_items, transform=train_transforms)
     val_dataset = Dataset(val_items, transform=val_transforms)
 
@@ -444,11 +563,10 @@ def train(args: argparse.Namespace) -> dict[str, float]:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
-    model = build_densenet121(
-        len(args.image_keys),
-        2,
-        dropout_prob=float(getattr(args, "dropout_prob", 0.0)),
-    ).to(device)
+    model = _build_binary_model(args).to(device)
+    ema_model = _make_ema_model(model, args, device)
+    if ema_model is not None:
+        print(f"Using EMA model for validation/checkpointing: decay={args.ema_decay}")
     criterion = _make_binary_criterion(train_items, device, args)
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -463,6 +581,8 @@ def train(args: argparse.Namespace) -> dict[str, float]:
     best_auc = -math.inf
     best_metrics: dict[str, float] = {}
     history: list[dict[str, Any]] = []
+    ema_decay = float(getattr(args, "ema_decay", 0.0))
+    grad_clip = float(getattr(args, "grad_clip", 0.0))
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
@@ -474,13 +594,22 @@ def train(args: argparse.Namespace) -> dict[str, float]:
             logits = model(images)
             loss = criterion(logits, labels)
             loss.backward()
+            if grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
+            _update_ema_model(model, ema_model, ema_decay)
             batch_count = int(labels.shape[0])
             running_loss += float(loss.detach()) * batch_count
             observed += batch_count
 
         train_loss = running_loss / max(observed, 1)
-        val_metrics, val_predictions = evaluate(model, val_loader, device)
+        validation_model = ema_model if ema_model is not None else model
+        val_metrics, val_predictions = evaluate(
+            validation_model,
+            val_loader,
+            device,
+            positive_threshold=float(getattr(args, "positive_threshold", 0.5)),
+        )
         _print_metrics(epoch, train_loss, val_metrics)
         history.append({"epoch": epoch, "train_loss": train_loss, **val_metrics})
         scheduler.step()
@@ -489,7 +618,7 @@ def train(args: argparse.Namespace) -> dict[str, float]:
             best_auc = val_metrics["auc"]
             best_metrics = dict(val_metrics)
             torch.save(
-                _checkpoint(model, optimizer, epoch, val_metrics, args),
+                _checkpoint(validation_model, optimizer, epoch, val_metrics, args),
                 output_dir / "best.pt",
             )
             write_csv(val_predictions, output_dir / "val_predictions.csv")
@@ -498,9 +627,15 @@ def train(args: argparse.Namespace) -> dict[str, float]:
                 output_dir / "best_val_metrics.json",
             )
 
-    final_metrics, _ = evaluate(model, val_loader, device)
+    final_model = ema_model if ema_model is not None else model
+    final_metrics, _ = evaluate(
+        final_model,
+        val_loader,
+        device,
+        positive_threshold=float(getattr(args, "positive_threshold", 0.5)),
+    )
     torch.save(
-        _checkpoint(model, optimizer, args.epochs, final_metrics, args),
+        _checkpoint(final_model, optimizer, args.epochs, final_metrics, args),
         output_dir / "last.pt",
     )
     write_csv(pd.DataFrame(history), output_dir / "training_history.csv")
@@ -544,6 +679,13 @@ def _label_smoothing_value(value: str) -> float:
     return parsed
 
 
+def _unit_interval(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0 or parsed > 1:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -559,6 +701,23 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=_positive_int,
         default=(160, 160, 64),
         metavar=("X", "Y", "Z"),
+    )
+    parser.add_argument(
+        "--crop_margin",
+        nargs=3,
+        type=int,
+        default=(16, 16, 8),
+        metavar=("X", "Y", "Z"),
+        help=(
+            "Margin for prostate-mask foreground crop before resize. "
+            "Try 24 24 12 or 32 32 16 if the crop is too tight."
+        ),
+    )
+    parser.add_argument(
+        "--no_mask_crop",
+        action="store_false",
+        dest="mask_crop",
+        help="Disable prostate-mask foreground cropping.",
     )
     parser.add_argument("--out_dir", type=Path, required=True)
     parser.add_argument("--epochs", type=_positive_int, default=50)
@@ -589,6 +748,39 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "How to handle binary class imbalance. 'class_weight' often gives "
             "better calibration than oversampling when imbalance is mild."
+        ),
+    )
+    parser.add_argument(
+        "--loss",
+        choices=("ce", "focal"),
+        default="ce",
+        help="Classification loss. Focal loss can improve ranking for hard cases.",
+    )
+    parser.add_argument(
+        "--focal_gamma",
+        type=_nonnegative_float,
+        default=2.0,
+        help="Focal-loss gamma when --loss focal is used.",
+    )
+    parser.add_argument(
+        "--grad_clip",
+        type=_nonnegative_float,
+        default=0.0,
+        help="Optional gradient norm clipping. Try 1.0 for unstable training.",
+    )
+    parser.add_argument(
+        "--ema_decay",
+        type=_dropout_probability,
+        default=0.0,
+        help="EMA decay for validation/checkpointing. Try 0.99.",
+    )
+    parser.add_argument(
+        "--positive_threshold",
+        type=_unit_interval,
+        default=0.5,
+        help=(
+            "Threshold for converting prob_1 to pred_label. Does not affect AUC. "
+            "Use validation-tuned values such as 0.90 for PI-RADS if needed."
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
