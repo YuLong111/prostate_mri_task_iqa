@@ -46,14 +46,6 @@ def _less_than_one_float(value: str) -> float:
     return parsed
 
 
-def _unit_interval(value: str) -> float:
-    """Parse a finite value in [0, 1]."""
-    parsed = float(value)
-    if not math.isfinite(parsed) or parsed < 0 or parsed > 1:
-        raise argparse.ArgumentTypeError("must be between 0 and 1")
-    return parsed
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse binary IQA training arguments."""
     parser = argparse.ArgumentParser(
@@ -80,23 +72,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=_positive_int,
         default=(160, 160, 64),
         metavar=("X", "Y", "Z"),
-    )
-    parser.add_argument(
-        "--crop_margin",
-        nargs=3,
-        type=int,
-        default=(16, 16, 8),
-        metavar=("X", "Y", "Z"),
-        help=(
-            "Margin for prostate-mask foreground crop before resize. "
-            "Try 24 24 12 or 32 32 16 if the crop is too tight."
-        ),
-    )
-    parser.add_argument(
-        "--no_mask_crop",
-        action="store_false",
-        dest="mask_crop",
-        help="Disable prostate-mask foreground cropping.",
     )
     parser.add_argument("--out_dir", type=Path, required=True)
     parser.add_argument("--epochs", type=_positive_int, default=50)
@@ -127,39 +102,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "How to handle binary class imbalance. 'class_weight' often gives "
             "better calibration than oversampling when imbalance is mild."
-        ),
-    )
-    parser.add_argument(
-        "--loss",
-        choices=("ce", "focal"),
-        default="ce",
-        help="Classification loss. Focal loss can improve ranking for hard cases.",
-    )
-    parser.add_argument(
-        "--focal_gamma",
-        type=_nonnegative_float,
-        default=2.0,
-        help="Focal-loss gamma when --loss focal is used.",
-    )
-    parser.add_argument(
-        "--grad_clip",
-        type=_nonnegative_float,
-        default=0.0,
-        help="Optional gradient norm clipping. Try 1.0 for unstable training.",
-    )
-    parser.add_argument(
-        "--ema_decay",
-        type=_less_than_one_float,
-        default=0.0,
-        help="EMA decay for validation/checkpointing. Try 0.99.",
-    )
-    parser.add_argument(
-        "--positive_threshold",
-        type=_unit_interval,
-        default=0.5,
-        help=(
-            "Threshold for converting prob_1 to pred_label. Does not affect AUC. "
-            "Use validation-tuned values such as 0.90 for PI-RADS if needed."
         ),
     )
     parser.add_argument("--seed", type=int, default=42)

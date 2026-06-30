@@ -19,16 +19,13 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold
 
 from prostate_iqa.data.transforms import get_train_transforms, get_val_transforms
+from prostate_iqa.models.densenet_quality import build_densenet121
 from prostate_iqa.training.train_binary_task import (
     _batch_strings,
-    _build_binary_model,
     _class_counts,
     _load_datalist,
     _make_binary_criterion,
-    _make_ema_model,
     _prepare_items,
-    _transform_kwargs,
-    _update_ema_model,
     _weighted_sampler,
 )
 from prostate_iqa.utils.io import ensure_dir, write_csv, write_json
@@ -187,18 +184,9 @@ def _make_loaders(
     fold_seed: int,
 ) -> tuple[DataLoader, DataLoader]:
     """Create shared-transform training and deterministic holdout loaders."""
-    transform_kwargs = _transform_kwargs(args)
-    train_transform = get_train_transforms(
-        args.image_keys,
-        args.roi_size,
-        **transform_kwargs,
-    )
+    train_transform = get_train_transforms(args.image_keys, args.roi_size)
     train_transform.set_random_state(seed=fold_seed)
-    holdout_transform = get_val_transforms(
-        args.image_keys,
-        args.roi_size,
-        **transform_kwargs,
-    )
+    holdout_transform = get_val_transforms(args.image_keys, args.roi_size)
     imbalance_strategy = getattr(args, "imbalance_strategy", "sampler")
     sampler = (
         _weighted_sampler(train_items, fold_seed)
@@ -258,13 +246,6 @@ def _fold_checkpoint(
         "weight_decay": float(getattr(args, "weight_decay", 0.0)),
         "label_smoothing": float(getattr(args, "label_smoothing", 0.0)),
         "imbalance_strategy": getattr(args, "imbalance_strategy", "sampler"),
-        "loss": getattr(args, "loss", "ce"),
-        "focal_gamma": float(getattr(args, "focal_gamma", 2.0)),
-        "ema_decay": float(getattr(args, "ema_decay", 0.0)),
-        "grad_clip": float(getattr(args, "grad_clip", 0.0)),
-        "positive_threshold": float(getattr(args, "positive_threshold", 0.5)),
-        "crop_margin": list(getattr(args, "crop_margin", (16, 16, 8))),
-        "mask_crop": bool(getattr(args, "mask_crop", True)),
         "scheduler": "cosine_annealing_lr",
         "train_patient_ids": list(train_patients),
         "holdout_patient_ids": list(holdout_patients),
@@ -279,7 +260,7 @@ def _train_fold(
     args: argparse.Namespace,
     fold: int,
     train_items: Sequence[dict[str, Any]],
-) -> tuple[torch.optim.Optimizer, float, list[dict[str, Any]], torch.nn.Module]:
+) -> tuple[torch.optim.Optimizer, float, list[dict[str, Any]]]:
     """Train one fold without observing holdout labels or predictions."""
     criterion = _make_binary_criterion(train_items, device, args)
     optimizer = torch.optim.AdamW(
@@ -291,13 +272,8 @@ def _train_fold(
         optimizer,
         T_max=args.epochs,
     )
-    ema_model = _make_ema_model(model, args, device)
-    if ema_model is not None:
-        print(f"  Using EMA for held-out predictions: decay={args.ema_decay}")
     history: list[dict[str, Any]] = []
     final_loss = float("nan")
-    ema_decay = float(getattr(args, "ema_decay", 0.0))
-    grad_clip = float(getattr(args, "grad_clip", 0.0))
     for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
@@ -309,10 +285,7 @@ def _train_fold(
             logits = model(images)
             loss = criterion(logits, labels)
             loss.backward()
-            if grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             optimizer.step()
-            _update_ema_model(model, ema_model, ema_decay)
             count = int(labels.shape[0])
             running_loss += float(loss.detach()) * count
             observed += count
@@ -323,7 +296,7 @@ def _train_fold(
             f"| train_loss={final_loss:.4f}"
         )
         scheduler.step()
-    return optimizer, final_loss, history, (ema_model if ema_model is not None else model)
+    return optimizer, final_loss, history
 
 
 @torch.inference_mode()
@@ -332,18 +305,15 @@ def _predict_holdout(
     loader: DataLoader,
     device: torch.device,
     fold: int,
-    positive_threshold: float = 0.5,
 ) -> pd.DataFrame:
     """Predict a held-out fold exactly once after training is complete."""
-    if not 0.0 <= positive_threshold <= 1.0:
-        raise ValueError("positive_threshold must be in [0, 1].")
     model.eval()
     rows: list[dict[str, Any]] = []
     for batch in loader:
         images = batch["image"].to(device, non_blocking=True)
         labels = torch.as_tensor(batch["label"], dtype=torch.long, device=device)
         probabilities = torch.softmax(model(images), dim=1)
-        predictions = (probabilities[:, 1] >= positive_threshold).long()
+        predictions = probabilities.argmax(dim=1)
 
         labels_cpu = labels.cpu().tolist()
         probabilities_cpu = probabilities.cpu().tolist()
@@ -460,15 +430,19 @@ def run_oof(args: argparse.Namespace) -> dict[str, Any]:
         train_loader, holdout_loader = _make_loaders(
             fold_train, fold_holdout, args, fold_seed
         )
-        model = _build_binary_model(args).to(device)
-        optimizer, train_loss, history, prediction_model = _train_fold(
+        model = build_densenet121(
+            len(args.image_keys),
+            out_channels=2,
+            dropout_prob=float(getattr(args, "dropout_prob", 0.0)),
+        ).to(device)
+        optimizer, train_loss, history = _train_fold(
             model, train_loader, device, args, fold, fold_train
         )
         all_history.extend(history)
         checkpoint_path = output_dir / f"fold_{fold}_best.pt"
         torch.save(
             _fold_checkpoint(
-                prediction_model,
+                model,
                 optimizer,
                 args,
                 fold,
@@ -479,13 +453,7 @@ def run_oof(args: argparse.Namespace) -> dict[str, Any]:
             checkpoint_path,
         )
 
-        predictions = _predict_holdout(
-            prediction_model,
-            holdout_loader,
-            device,
-            fold,
-            positive_threshold=float(getattr(args, "positive_threshold", 0.5)),
-        )
+        predictions = _predict_holdout(model, holdout_loader, device, fold)
         write_csv(predictions, output_dir / f"fold_{fold}_predictions.csv")
         fold_metrics = _fold_metrics(predictions, fold)
         fold_metric_rows.append(fold_metrics)
@@ -499,7 +467,7 @@ def run_oof(args: argparse.Namespace) -> dict[str, Any]:
             f"  Held-out fold {fold}: AUC={auc_text}, "
             f"accuracy={fold_metrics['accuracy']:.4f}"
         )
-        del model, prediction_model, optimizer
+        del model, optimizer
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -571,14 +539,6 @@ def _less_than_one_float(value: str) -> float:
     return parsed
 
 
-def _unit_interval(value: str) -> float:
-    """Parse a finite value in [0, 1]."""
-    parsed = float(value)
-    if not math.isfinite(parsed) or parsed < 0 or parsed > 1:
-        raise argparse.ArgumentTypeError("must be between 0 and 1")
-    return parsed
-
-
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse OOF training command-line arguments."""
     parser = argparse.ArgumentParser(
@@ -597,23 +557,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         type=_positive_int,
         default=(160, 160, 64),
         metavar=("X", "Y", "Z"),
-    )
-    parser.add_argument(
-        "--crop_margin",
-        nargs=3,
-        type=int,
-        default=(16, 16, 8),
-        metavar=("X", "Y", "Z"),
-        help=(
-            "Margin for prostate-mask foreground crop before resize. "
-            "Try 24 24 12 or 32 32 16 if the crop is too tight."
-        ),
-    )
-    parser.add_argument(
-        "--no_mask_crop",
-        action="store_false",
-        dest="mask_crop",
-        help="Disable prostate-mask foreground cropping.",
     )
     parser.add_argument("--out_dir", type=Path, required=True)
     parser.add_argument("--epochs", type=_positive_int, default=50)
@@ -644,39 +587,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help=(
             "How to handle binary class imbalance. 'class_weight' often gives "
             "better calibration than oversampling when imbalance is mild."
-        ),
-    )
-    parser.add_argument(
-        "--loss",
-        choices=("ce", "focal"),
-        default="ce",
-        help="Classification loss. Focal loss can improve ranking for hard cases.",
-    )
-    parser.add_argument(
-        "--focal_gamma",
-        type=_nonnegative_float,
-        default=2.0,
-        help="Focal-loss gamma when --loss focal is used.",
-    )
-    parser.add_argument(
-        "--grad_clip",
-        type=_nonnegative_float,
-        default=0.0,
-        help="Optional gradient norm clipping. Try 1.0 for unstable training.",
-    )
-    parser.add_argument(
-        "--ema_decay",
-        type=_less_than_one_float,
-        default=0.0,
-        help="EMA decay for held-out predictions/checkpointing. Try 0.99.",
-    )
-    parser.add_argument(
-        "--positive_threshold",
-        type=_unit_interval,
-        default=0.5,
-        help=(
-            "Threshold for converting prob_1 to pred_label. Does not affect AUC. "
-            "Use validation-tuned values such as 0.90 for PI-RADS if needed."
         ),
     )
     parser.add_argument("--seed", type=int, default=42)
